@@ -1,12 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-// Mock lite-object-pool with the real implementation
-vi.mock('lite-object-pool', async () => {
-    const { ObjectPool } = await import('./LiteObjectPool.js');
-    return { default: ObjectPool, ObjectPool };
-});
-
-import { Emitter } from './LiteParticles.js';
+import { Emitter } from './Emitter.js';
 
 describe('🎆 lite-particles', () => {
     let emitter;
