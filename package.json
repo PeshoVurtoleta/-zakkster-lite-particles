@@ -1,0 +1,44 @@
+{
+  "name": "@zakkster/lite-particles",
+  "version": "1.0.0",
+  "description": "A headless particle engine with GC-free physics, lifecycle management, and bounds culling.",
+  "type": "module",
+  "main": "Emitter.js",
+  "types": "Emitter.d.ts",
+  "exports": {
+    ".": {
+      "types": "./Emitter.d.ts",
+      "import": "./Emitter.js",
+      "default": "./Emitter.js"
+    }
+  },
+  "files": [
+    "Emitter.js",
+    "Emitter.d.ts",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "lite-object-pool": "^1.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "particles",
+    "particle-engine",
+    "emitter",
+    "physics",
+    "game",
+    "canvas",
+    "object-pool",
+    "gc-free"
+  ]
+}
