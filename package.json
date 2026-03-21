@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-particles",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "description": "A headless particle engine with GC-free physics, lifecycle management, and bounds culling.",
   "type": "module",
   "main": "Emitter.js",
@@ -22,13 +22,13 @@
     "test:watch": "vitest"
   },
   "license": "MIT",
-  "homepage": "https://github.com/PeshoVurtoleta/-zakkster-lite-particles#readme",
+  "homepage": "https://github.com/PeshoVurtoleta/lite-particles#readme",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/PeshoVurtoleta/-zakkster-lite-particles.git"
+    "url": "git+https://github.com/PeshoVurtoleta/lite-particles.git"
   },
   "bugs": {
-    "url": "https://github.com/PeshoVurtoleta/-zakkster-lite-particles/issues",
+    "url": "https://github.com/PeshoVurtoleta/lite-particles/issues",
     "email": "shinikchiev@yahoo.com"
   },
   "dependencies": {
