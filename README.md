@@ -2,6 +2,7 @@
 
 [![npm version](https://img.shields.io/npm/v/@zakkster/lite-particles.svg?style=for-the-badge&color=latest)](https://www.npmjs.com/package/@zakkster/lite-particles)
 [![sponsor](https://img.shields.io/badge/sponsor-PeshoVurtoleta-ea4aaa.svg?logo=github)](https://github.com/sponsors/PeshoVurtoleta)
+![Tree-Shakeable](https://img.shields.io/badge/tree--shakeable-yes-brightgreen)
 [![npm bundle size](https://img.shields.io/bundlephobia/minzip/@zakkster/lite-particles?style=for-the-badge)](https://bundlephobia.com/result?p=@zakkster/lite-particles)
 [![npm downloads](https://img.shields.io/npm/dm/@zakkster/lite-particles?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-particles)
 [![npm total downloads](https://img.shields.io/npm/dt/@zakkster/lite-particles?style=for-the-badge&color=blue)](https://www.npmjs.com/package/@zakkster/lite-particles)
