@@ -1,0 +1,67 @@
+{
+  "name": "@zakkster/lite-particles",
+  "version": "1.1.0",
+  "description": "A headless particle engine with GC-free physics, lifecycle management, bounds culling, declarative emission zones, and seeded deterministic replay.",
+  "type": "module",
+  "main": "./Emitter.js",
+  "types": "./Emitter.d.ts",
+  "module": "./Emitter.js",
+  "exports": {
+    ".": {
+      "types": "./Emitter.d.ts",
+      "node": "./Emitter.js",
+      "import": "./Emitter.js",
+      "default": "./Emitter.js"
+    }
+  },
+  "files": [
+    "Emitter.js",
+    "Emitter.d.ts",
+    "README.md",
+    "llms.txt"
+  ],
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/PeshoVurtoleta/lite-particles#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/PeshoVurtoleta/lite-particles.git"
+  },
+  "bugs": {
+    "url": "https://github.com/PeshoVurtoleta/lite-particles/issues",
+    "email": "shinikchiev@yahoo.com"
+  },
+  "funding": {
+    "type": "github",
+    "url": "https://github.com/sponsors/PeshoVurtoleta"
+  },
+  "sideEffects": false,
+  "dependencies": {
+    "@zakkster/lite-random": "^1.1.0",
+    "lite-object-pool": "^1.0.0"
+  },
+  "devDependencies": {
+    "vitest": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "keywords": [
+    "particles",
+    "particle-engine",
+    "emitter",
+    "physics",
+    "game",
+    "canvas",
+    "object-pool",
+    "gc-free",
+    "emission-zones",
+    "deterministic",
+    "seeded",
+    "replay",
+    "headless"
+  ]
+}
