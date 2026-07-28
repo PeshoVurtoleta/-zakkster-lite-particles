@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-particles",
-  "version": "1.1.0",
+  "version": "1.1.1",
   "description": "A headless particle engine with GC-free physics, lifecycle management, bounds culling, declarative emission zones, and seeded deterministic replay.",
   "type": "module",
   "main": "./Emitter.js",
@@ -18,11 +18,15 @@
     "Emitter.js",
     "Emitter.d.ts",
     "README.md",
-    "llms.txt"
+    "CHANGELOG.md",
+    "llms.txt",
+    "LICENSE"
   ],
   "scripts": {
-    "test": "vitest run",
-    "test:watch": "vitest"
+    "test": "node --expose-gc --test test/*.test.js",
+    "test:watch": "node --test --watch test/*.test.js",
+    "torture": "node --expose-gc test/torture.mjs",
+    "verify": "npm test && npm run torture"
   },
   "license": "MIT",
   "homepage": "https://github.com/PeshoVurtoleta/lite-particles#readme",
@@ -44,10 +48,10 @@
     "lite-object-pool": "^1.0.0"
   },
   "devDependencies": {
-    "vitest": "^1.0.0"
+    "@zakkster/lite-gc-profiler": "^1.11.0"
   },
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18"
   },
   "keywords": [
     "particles",

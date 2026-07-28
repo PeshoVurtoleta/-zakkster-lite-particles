@@ -1,56 +1,70 @@
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, beforeEach, mock } from 'node:test';
+import assert from 'node:assert/strict';
 
-import { Emitter, normalizeZone } from './Emitter.js';
+import { Emitter, normalizeZone, VERSION } from '../Emitter.js';
 
-describe('🎆 lite-particles', () => {
+// toBeCloseTo parity (from the ported suite): pass when |expected - actual| < 10**-digits / 2.
+const closeTo = (actual, expected, digits = 2) =>
+    assert.ok(
+        Math.abs(expected - actual) < Math.pow(10, -digits) / 2,
+        `expected ${actual} to be close to ${expected} (${digits} digits)`
+    );
+
+describe('lite-particles', () => {
     let emitter;
 
     beforeEach(() => {
         emitter = new Emitter({ maxParticles: 100 });
     });
 
+    describe('package metadata', () => {
+        it('exports a VERSION string', () => {
+            assert.equal(typeof VERSION, 'string');
+        });
+    });
+
     describe('constructor', () => {
         it('starts with 0 active particles', () => {
-            expect(emitter.activeCount).toBe(0);
+            assert.equal(emitter.activeCount, 0);
         });
 
         it('accepts custom maxParticles', () => {
             const em = new Emitter({ maxParticles: 50 });
-            expect(em.pool.size).toBe(50);
+            assert.equal(em.pool.size, 50);
         });
 
         it('accepts onUpdate hook', () => {
-            const hook = vi.fn();
+            const hook = mock.fn();
             const em = new Emitter({ onUpdate: hook });
-            expect(em.onUpdate).toBe(hook);
+            assert.equal(em.onUpdate, hook);
         });
 
         it('accepts bounds', () => {
             const bounds = { x: 0, y: 0, width: 800, height: 600 };
             const em = new Emitter({ bounds });
-            expect(em.bounds).toBe(bounds);
+            assert.equal(em.bounds, bounds);
         });
     });
 
     describe('emit()', () => {
         it('spawns a particle', () => {
             const p = emitter.emit({ x: 100, y: 200, life: 1 });
-            expect(p).not.toBeNull();
-            expect(p.x).toBe(100);
-            expect(p.y).toBe(200);
-            expect(emitter.activeCount).toBe(1);
+            assert.notEqual(p, null);
+            assert.equal(p.x, 100);
+            assert.equal(p.y, 200);
+            assert.equal(emitter.activeCount, 1);
         });
 
         it('returns null when pool is full', () => {
             const em = new Emitter({ maxParticles: 2 });
             em.emit({ life: 1 });
             em.emit({ life: 1 });
-            expect(em.emit({ life: 1 })).toBeNull();
+            assert.equal(em.emit({ life: 1 }), null);
         });
 
         it('returns null after destroy', () => {
             emitter.destroy();
-            expect(emitter.emit({ life: 1 })).toBeNull();
+            assert.equal(emitter.emit({ life: 1 }), null);
         });
     });
 
@@ -59,13 +73,13 @@ describe('🎆 lite-particles', () => {
             emitter.emitBurst(10, (i) => ({
                 x: i * 10, y: 0, life: 1,
             }));
-            expect(emitter.activeCount).toBe(10);
+            assert.equal(emitter.activeCount, 10);
         });
 
         it('stops when pool fills', () => {
             const em = new Emitter({ maxParticles: 5 });
             em.emitBurst(10, () => ({ life: 1 }));
-            expect(em.activeCount).toBe(5);
+            assert.equal(em.activeCount, 5);
         });
 
         it('passes index to configFn', () => {
@@ -74,7 +88,7 @@ describe('🎆 lite-particles', () => {
                 configs.push(i);
                 return { life: 1 };
             });
-            expect(configs).toEqual([0, 1, 2]);
+            assert.deepEqual(configs, [0, 1, 2]);
         });
     });
 
@@ -82,37 +96,37 @@ describe('🎆 lite-particles', () => {
         it('decrements particle life', () => {
             const p = emitter.emit({ life: 1, maxLife: 1 });
             emitter.update(0.5);
-            expect(p.life).toBeCloseTo(0.5);
+            closeTo(p.life, 0.5);
         });
 
         it('removes dead particles', () => {
             emitter.emit({ life: 0.1 });
-            emitter.update(0.2); // life goes to -0.1 → released
-            expect(emitter.activeCount).toBe(0);
+            emitter.update(0.2); // life goes to -0.1 -> released
+            assert.equal(emitter.activeCount, 0);
         });
 
         it('applies gravity', () => {
             const p = emitter.emit({ life: 10, vy: 0, gravity: 100 });
             emitter.update(0.1);
-            expect(p.vy).toBeCloseTo(10); // gravity * dt = 100 * 0.1
+            closeTo(p.vy, 10); // gravity * dt = 100 * 0.1
         });
 
         it('applies drag', () => {
             const p = emitter.emit({ life: 10, vx: 100, drag: 0.9 });
             emitter.update(1 / 60);
-            expect(p.vx).toBeLessThan(100);
+            assert.ok(p.vx < 100);
         });
 
         it('updates position', () => {
             const p = emitter.emit({ life: 10, x: 0, vx: 100 });
             emitter.update(0.1);
-            expect(p.x).toBeCloseTo(10); // 100 * 0.1
+            closeTo(p.x, 10); // 100 * 0.1
         });
 
         it('skips drag when drag is 1', () => {
             const p = emitter.emit({ life: 10, vx: 50, drag: 1 });
             emitter.update(0.1);
-            expect(p.vx).toBe(50); // unchanged
+            assert.equal(p.vx, 50); // unchanged
         });
 
         it('culls out-of-bounds particles', () => {
@@ -121,37 +135,40 @@ describe('🎆 lite-particles', () => {
                 bounds: { x: 0, y: 0, width: 100, height: 100 },
             });
             em.emit({ x: 50, y: 50, vx: 2000, life: 10 });
-            em.update(0.1); // x = 50 + 2000*0.1 = 250 → out of bounds
-            expect(em.activeCount).toBe(0);
+            em.update(0.1); // x = 50 + 2000*0.1 = 250 -> out of bounds
+            assert.equal(em.activeCount, 0);
         });
 
         it('calls onUpdate hook', () => {
-            const hook = vi.fn();
+            const hook = mock.fn();
             const em = new Emitter({ maxParticles: 10, onUpdate: hook });
             em.emit({ life: 10 });
             em.update(0.016);
-            expect(hook).toHaveBeenCalledWith(expect.any(Object), 0.016);
+            assert.equal(hook.mock.callCount(), 1);
+            const args = hook.mock.calls[0].arguments;
+            assert.equal(typeof args[0], 'object');
+            assert.equal(args[1], 0.016);
         });
 
         it('is no-op after destroy', () => {
             emitter.emit({ life: 1 });
             emitter.destroy();
-            expect(() => emitter.update(0.1)).not.toThrow();
+            assert.doesNotThrow(() => emitter.update(0.1));
         });
     });
 
     describe('clear()', () => {
         it('releases all active particles', () => {
             emitter.emitBurst(10, () => ({ life: 1 }));
-            expect(emitter.activeCount).toBe(10);
+            assert.equal(emitter.activeCount, 10);
             emitter.clear();
-            expect(emitter.activeCount).toBe(0);
+            assert.equal(emitter.activeCount, 0);
         });
 
         it('is no-op after destroy', () => {
             emitter.emit({ life: 1 });
             emitter.destroy();
-            expect(() => emitter.clear()).not.toThrow();
+            assert.doesNotThrow(() => emitter.clear());
         });
     });
 
@@ -161,71 +178,71 @@ describe('🎆 lite-particles', () => {
             emitter.emit({ life: 0.5, maxLife: 1 });
 
             const ctx = {};
-            const callback = vi.fn();
+            const callback = mock.fn();
             emitter.draw(ctx, callback);
 
-            expect(callback).toHaveBeenCalledTimes(2);
+            assert.equal(callback.mock.callCount(), 2);
         });
 
         it('passes normalized life (1 at birth, 0 at death)', () => {
             emitter.emit({ life: 0.5, maxLife: 1 });
 
             const ctx = {};
-            const callback = vi.fn();
+            const callback = mock.fn();
             emitter.draw(ctx, callback);
 
-            const normalizedLife = callback.mock.calls[0][2];
-            expect(normalizedLife).toBeCloseTo(0.5);
+            const normalizedLife = callback.mock.calls[0].arguments[2];
+            closeTo(normalizedLife, 0.5);
         });
 
         it('passes ctx and particle to callback', () => {
             const p = emitter.emit({ life: 1, maxLife: 1 });
 
             const ctx = { fake: true };
-            const callback = vi.fn();
+            const callback = mock.fn();
             emitter.draw(ctx, callback);
 
-            expect(callback.mock.calls[0][0]).toBe(ctx);
-            expect(callback.mock.calls[0][1]).toBe(p);
+            assert.equal(callback.mock.calls[0].arguments[0], ctx);
+            assert.equal(callback.mock.calls[0].arguments[1], p);
         });
 
         it('is no-op after destroy', () => {
             emitter.emit({ life: 1 });
             emitter.destroy();
-            const callback = vi.fn();
+            const callback = mock.fn();
             emitter.draw({}, callback);
-            expect(callback).not.toHaveBeenCalled();
+            assert.equal(callback.mock.callCount(), 0);
         });
     });
 
     describe('destroy()', () => {
         it('sets _destroyed flag', () => {
             emitter.destroy();
-            expect(emitter._destroyed).toBe(true);
+            assert.equal(emitter._destroyed, true);
         });
 
         it('destroys the pool', () => {
-            const spy = vi.spyOn(emitter.pool, 'destroy');
+            const spy = mock.method(emitter.pool, 'destroy');
             emitter.destroy();
-            expect(spy).toHaveBeenCalled();
+            assert.ok(spy.mock.callCount() > 0);
         });
 
         it('is idempotent', () => {
             emitter.destroy();
-            expect(() => emitter.destroy()).not.toThrow();
+            assert.doesNotThrow(() => emitter.destroy());
         });
 
         it('nulls onUpdate and bounds', () => {
             emitter.onUpdate = () => {};
             emitter.bounds = { x: 0, y: 0, width: 100, height: 100 };
             emitter.destroy();
-            expect(emitter.onUpdate).toBeNull();
-            expect(emitter.bounds).toBeNull();
+            assert.equal(emitter.onUpdate, null);
+            assert.equal(emitter.bounds, null);
         });
     });
 
     describe('full lifecycle', () => {
-        it('emit → update → draw → clear cycle', () => {
+        it('emit -> update -> draw -> clear cycle', () => {
             // Spawn burst
             emitter.emitBurst(20, (i) => ({
                 x: 400, y: 300,
@@ -235,33 +252,33 @@ describe('🎆 lite-particles', () => {
                 life: 1,
                 maxLife: 1,
             }));
-            expect(emitter.activeCount).toBe(20);
+            assert.equal(emitter.activeCount, 20);
 
             // Simulate a few frames
             for (let i = 0; i < 10; i++) emitter.update(0.016);
 
             // Some may have died
-            expect(emitter.activeCount).toBeLessThanOrEqual(20);
+            assert.ok(emitter.activeCount <= 20);
 
             // Draw
             const ctx = {};
             const drawn = [];
             emitter.draw(ctx, (_, p, life) => drawn.push(life));
-            expect(drawn.length).toBe(emitter.activeCount);
-            drawn.forEach(life => {
-                expect(life).toBeGreaterThanOrEqual(0);
-                expect(life).toBeLessThanOrEqual(1);
+            assert.equal(drawn.length, emitter.activeCount);
+            drawn.forEach((life) => {
+                assert.ok(life >= 0);
+                assert.ok(life <= 1);
             });
 
             // Clear
             emitter.clear();
-            expect(emitter.activeCount).toBe(0);
+            assert.equal(emitter.activeCount, 0);
         });
     });
 
-    // ══════════════════════════════════════════════════════════
-    //  v1.1.0 — emission zones
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
+    //  v1.1.0 - emission zones
+    // ==========================================================
 
     /** Collect the spawned positions of every live particle. */
     const positions = (e) => {
@@ -273,38 +290,38 @@ describe('🎆 lite-particles', () => {
 
     describe('normalizeZone()', () => {
         it('returns null for null/undefined', () => {
-            expect(normalizeZone(null)).toBe(null);
-            expect(normalizeZone(undefined)).toBe(null);
+            assert.equal(normalizeZone(null), null);
+            assert.equal(normalizeZone(undefined), null);
         });
         it('throws on an unknown type rather than silently emitting at 0,0', () => {
-            expect(() => normalizeZone({ type: 'blob' })).toThrow(RangeError);
+            assert.throws(() => normalizeZone({ type: 'blob' }), RangeError);
         });
         it('throws on a non-object', () => {
-            expect(() => normalizeZone('ring')).toThrow(TypeError);
+            assert.throws(() => normalizeZone('ring'), TypeError);
         });
         it('rejects missing or non-finite point fields', () => {
-            expect(() => normalizeZone({ type: 'point', x: 0 })).toThrow(TypeError);
-            expect(() => normalizeZone({ type: 'point', x: NaN, y: 0 })).toThrow(TypeError);
+            assert.throws(() => normalizeZone({ type: 'point', x: 0 }), TypeError);
+            assert.throws(() => normalizeZone({ type: 'point', x: NaN, y: 0 }), TypeError);
         });
         it('rejects incomplete line / rect / ring', () => {
-            expect(() => normalizeZone({ type: 'line', x1: 0, y1: 0, x2: 5 })).toThrow(TypeError);
-            expect(() => normalizeZone({ type: 'rect', x: 0, y: 0, width: 5 })).toThrow(TypeError);
-            expect(() => normalizeZone({ type: 'ring', x: 0, y: 0 })).toThrow(TypeError);
-            expect(() => normalizeZone({ type: 'ring', x: 0, y: 0, radius: -1 })).toThrow(TypeError);
+            assert.throws(() => normalizeZone({ type: 'line', x1: 0, y1: 0, x2: 5 }), TypeError);
+            assert.throws(() => normalizeZone({ type: 'rect', x: 0, y: 0, width: 5 }), TypeError);
+            assert.throws(() => normalizeZone({ type: 'ring', x: 0, y: 0 }), TypeError);
+            assert.throws(() => normalizeZone({ type: 'ring', x: 0, y: 0, radius: -1 }), TypeError);
         });
         it('defaults ring innerRadius to radius (perimeter)', () => {
-            expect(normalizeZone({ type: 'ring', x: 0, y: 0, radius: 10 }).innerRadius).toBe(10);
+            assert.equal(normalizeZone({ type: 'ring', x: 0, y: 0, radius: 10 }).innerRadius, 10);
         });
         it('rejects an innerRadius outside [0, radius]', () => {
-            expect(() => normalizeZone({ type: 'ring', x: 0, y: 0, radius: 10, innerRadius: 11 })).toThrow(RangeError);
-            expect(() => normalizeZone({ type: 'ring', x: 0, y: 0, radius: 10, innerRadius: -1 })).toThrow(RangeError);
+            assert.throws(() => normalizeZone({ type: 'ring', x: 0, y: 0, radius: 10, innerRadius: 11 }), RangeError);
+            assert.throws(() => normalizeZone({ type: 'ring', x: 0, y: 0, radius: 10, innerRadius: -1 }), RangeError);
         });
         it('returns a fresh object, so mutating the caller copy cannot corrupt the emitter', () => {
             const src = { type: 'point', x: 1, y: 2 };
             const z = normalizeZone(src);
-            expect(z).not.toBe(src);
+            assert.notEqual(z, src);
             src.x = 999;
-            expect(z.x).toBe(1);
+            assert.equal(z.x, 1);
         });
     });
 
@@ -313,8 +330,8 @@ describe('🎆 lite-particles', () => {
             const e = new Emitter({ maxParticles: 10, seed: 1, zone: { type: 'point', x: 42, y: 99 } });
             e.emitBurst(5, alive);
             for (const p of positions(e)) {
-                expect(p.x).toBe(42);
-                expect(p.y).toBe(99);
+                assert.equal(p.x, 42);
+                assert.equal(p.y, 99);
             }
         });
     });
@@ -324,15 +341,15 @@ describe('🎆 lite-particles', () => {
             const e = new Emitter({ maxParticles: 300, seed: 2, zone: { type: 'line', x1: 0, y1: 0, x2: 100, y2: 50 } });
             e.emitBurst(300, alive);
             for (const p of positions(e)) {
-                expect(p.x).toBeGreaterThanOrEqual(0);
-                expect(p.x).toBeLessThanOrEqual(100);
-                expect(p.y).toBeCloseTo(p.x * 0.5, 6);   // exactly on the line
+                assert.ok(p.x >= 0);
+                assert.ok(p.x <= 100);
+                closeTo(p.y, p.x * 0.5, 6);   // exactly on the line
             }
         });
         it('handles a degenerate zero-length line', () => {
             const e = new Emitter({ maxParticles: 5, seed: 3, zone: { type: 'line', x1: 7, y1: 7, x2: 7, y2: 7 } });
             e.emitBurst(5, alive);
-            for (const p of positions(e)) { expect(p.x).toBe(7); expect(p.y).toBe(7); }
+            for (const p of positions(e)) { assert.equal(p.x, 7); assert.equal(p.y, 7); }
         });
     });
 
@@ -341,10 +358,10 @@ describe('🎆 lite-particles', () => {
             const e = new Emitter({ maxParticles: 400, seed: 4, zone: { type: 'rect', x: 10, y: 20, width: 100, height: 50 } });
             e.emitBurst(400, alive);
             for (const p of positions(e)) {
-                expect(p.x).toBeGreaterThanOrEqual(10);
-                expect(p.x).toBeLessThan(110);
-                expect(p.y).toBeGreaterThanOrEqual(20);
-                expect(p.y).toBeLessThan(70);
+                assert.ok(p.x >= 10);
+                assert.ok(p.x < 110);
+                assert.ok(p.y >= 20);
+                assert.ok(p.y < 70);
             }
         });
     });
@@ -354,7 +371,7 @@ describe('🎆 lite-particles', () => {
             const e = new Emitter({ maxParticles: 400, seed: 5, zone: { type: 'ring', x: 0, y: 0, radius: 10 } });
             e.emitBurst(400, alive);
             for (const p of positions(e)) {
-                expect(Math.hypot(p.x, p.y)).toBeCloseTo(10, 9);
+                closeTo(Math.hypot(p.x, p.y), 10, 9);
             }
         });
 
@@ -363,8 +380,8 @@ describe('🎆 lite-particles', () => {
             e.emitBurst(500, alive);
             for (const p of positions(e)) {
                 const r = Math.hypot(p.x, p.y);
-                expect(r).toBeGreaterThanOrEqual(4 - 1e-9);
-                expect(r).toBeLessThanOrEqual(10 + 1e-9);
+                assert.ok(r >= 4 - 1e-9);
+                assert.ok(r <= 10 + 1e-9);
             }
         });
 
@@ -376,8 +393,8 @@ describe('🎆 lite-particles', () => {
             e.emitBurst(20000, alive);
             const pts = positions(e);
             const inner = pts.filter((p) => Math.hypot(p.x, p.y) < 10 / Math.SQRT2).length;
-            expect(inner / pts.length).toBeGreaterThan(0.47);
-            expect(inner / pts.length).toBeLessThan(0.53);
+            assert.ok(inner / pts.length > 0.47);
+            assert.ok(inner / pts.length < 0.53);
         });
     });
 
@@ -385,42 +402,42 @@ describe('🎆 lite-particles', () => {
         it('config x/y overrides the zone sample', () => {
             const e = new Emitter({ maxParticles: 5, seed: 8, zone: { type: 'rect', x: 0, y: 0, width: 100, height: 100 } });
             e.emitBurst(3, () => ({ ...alive(), x: -1, y: -2 }));
-            for (const p of positions(e)) { expect(p.x).toBe(-1); expect(p.y).toBe(-2); }
+            for (const p of positions(e)) { assert.equal(p.x, -1); assert.equal(p.y, -2); }
         });
 
         it('no zone leaves the v1.0 behaviour untouched', () => {
             const e = new Emitter({ maxParticles: 5 });
             e.emitBurst(3, () => ({ ...alive(), x: 5, y: 6 }));
-            for (const p of positions(e)) { expect(p.x).toBe(5); expect(p.y).toBe(6); }
+            for (const p of positions(e)) { assert.equal(p.x, 5); assert.equal(p.y, 6); }
         });
 
         it('setZone() swaps the shape at runtime, and null restores raw config x/y', () => {
             const e = new Emitter({ maxParticles: 10, seed: 9, zone: { type: 'point', x: 1, y: 1 } });
             e.setZone({ type: 'point', x: 8, y: 9 });
             e.emitBurst(1, alive);
-            expect(positions(e)[0]).toEqual({ x: 8, y: 9 });
+            assert.deepEqual(positions(e)[0], { x: 8, y: 9 });
             e.clear();
             e.setZone(null);
             e.emitBurst(1, () => ({ ...alive(), x: 3, y: 4 }));
-            expect(positions(e)[0]).toEqual({ x: 3, y: 4 });
+            assert.deepEqual(positions(e)[0], { x: 3, y: 4 });
         });
 
         it('a moving emitter can mutate zone.x directly', () => {
             const e = new Emitter({ maxParticles: 10, seed: 10, zone: { type: 'point', x: 0, y: 0 } });
             e.zone.x = 250;
             e.emitBurst(1, alive);
-            expect(positions(e)[0].x).toBe(250);
+            assert.equal(positions(e)[0].x, 250);
         });
 
         it('setZone() rejects a malformed zone', () => {
             const e = new Emitter({ maxParticles: 5 });
-            expect(() => e.setZone({ type: 'nope' })).toThrow(RangeError);
+            assert.throws(() => e.setZone({ type: 'nope' }), RangeError);
         });
     });
 
-    // ══════════════════════════════════════════════════════════
-    //  v1.1.0 — determinism
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
+    //  v1.1.0 - determinism
+    // ==========================================================
 
     describe('seeded determinism', () => {
         const emitRing = (seed) => {
@@ -430,11 +447,11 @@ describe('🎆 lite-particles', () => {
         };
 
         it('same seed => identical emission sequence', () => {
-            expect(emitRing(12345)).toEqual(emitRing(12345));
+            assert.deepEqual(emitRing(12345), emitRing(12345));
         });
 
         it('different seed => different sequence', () => {
-            expect(emitRing(1)).not.toEqual(emitRing(2));
+            assert.notDeepEqual(emitRing(1), emitRing(2));
         });
 
         it('.seed(s) re-seeds and replays, matching lite-confetti', () => {
@@ -445,7 +462,7 @@ describe('🎆 lite-particles', () => {
             e.clear();
             e.seed(99);
             e.emitBurst(10, alive);
-            expect(positions(e)).toEqual(first);
+            assert.deepEqual(positions(e), first);
         });
 
         it('a FULL POOL does not burn an rng draw, so replay survives saturation', () => {
@@ -455,10 +472,10 @@ describe('🎆 lite-particles', () => {
             const expected = positions(roomy);
 
             // Now a pool of 3, hammered with 50 emits. The 47 rejected emits must not
-            // advance the stream — if the zone were sampled before acquire(), they would.
+            // advance the stream - if the zone were sampled before acquire(), they would.
             const tight = new Emitter({ maxParticles: 3, seed: 77, zone: { type: 'rect', x: 0, y: 0, width: 100, height: 100 } });
-            expect(tight.emitBurst(50, alive)).toBe(3);
-            expect(positions(tight)).toEqual(expected);
+            assert.equal(tight.emitBurst(50, alive), 3);
+            assert.deepEqual(positions(tight), expected);
         });
 
         it('accepts an injected PRNG via `random`', () => {
@@ -466,87 +483,86 @@ describe('🎆 lite-particles', () => {
             const fake = { next: () => [0.25, 0.75][n++ % 2] };
             const e = new Emitter({ maxParticles: 5, random: fake, zone: { type: 'rect', x: 0, y: 0, width: 100, height: 200 } });
             e.emitBurst(1, alive);
-            expect(positions(e)[0]).toEqual({ x: 25, y: 150 });
+            assert.deepEqual(positions(e)[0], { x: 25, y: 150 });
         });
 
         it('rejects a `random` without next()', () => {
-            expect(() => new Emitter({ random: {} })).toThrow(TypeError);
+            assert.throws(() => new Emitter({ random: {} }), TypeError);
         });
 
         it('.seed() is a no-op when you brought your own PRNG', () => {
-            const fake = { next: () => 0.5, reset: vi.fn() };
+            const fake = { next: () => 0.5, reset: mock.fn() };
             const e = new Emitter({ maxParticles: 5, random: fake });
             e.seed(1);
-            expect(fake.reset).not.toHaveBeenCalled();
+            assert.equal(fake.reset.mock.callCount(), 0);
         });
 
         it('exposes .random so a configFn can share the stream', () => {
             const e = new Emitter({ maxParticles: 10, seed: 5 });
-            expect(typeof e.random.next).toBe('function');
+            assert.equal(typeof e.random.next, 'function');
         });
     });
 
-    // ══════════════════════════════════════════════════════════
-    //  v1.1.0 — recycledThisFrame
-    // ══════════════════════════════════════════════════════════
+    // ==========================================================
+    //  v1.1.0 - recycledThisFrame
+    // ==========================================================
 
     describe('recycledThisFrame', () => {
         it('starts at 0', () => {
-            expect(new Emitter({ maxParticles: 10 }).recycledThisFrame).toBe(0);
+            assert.equal(new Emitter({ maxParticles: 10 }).recycledThisFrame, 0);
         });
 
         it('counts particles that died of old age', () => {
             const e = new Emitter({ maxParticles: 10 });
             e.emitBurst(4, () => ({ life: 0.1, maxLife: 0.1 }));
             e.update(0.2);
-            expect(e.recycledThisFrame).toBe(4);
-            expect(e.activeCount).toBe(0);
+            assert.equal(e.recycledThisFrame, 4);
+            assert.equal(e.activeCount, 0);
         });
 
         it('counts particles culled by bounds', () => {
             const e = new Emitter({ maxParticles: 10, bounds: { x: 0, y: 0, width: 100, height: 100 } });
             e.emitBurst(3, () => ({ x: 50, y: 50, vx: 10000, vy: 0, life: 10, maxLife: 10 }));
             e.update(1 / 60);
-            expect(e.recycledThisFrame).toBe(3);
+            assert.equal(e.recycledThisFrame, 3);
         });
 
-        it('is frame-perfect — it resets on every update()', () => {
+        it('is frame-perfect - it resets on every update()', () => {
             const e = new Emitter({ maxParticles: 10 });
             e.emitBurst(2, () => ({ life: 0.1, maxLife: 0.1 }));
             e.update(0.2);
-            expect(e.recycledThisFrame).toBe(2);
+            assert.equal(e.recycledThisFrame, 2);
             e.update(0.2);
-            expect(e.recycledThisFrame).toBe(0);
+            assert.equal(e.recycledThisFrame, 0);
         });
 
         it('is 0 when nothing died', () => {
             const e = new Emitter({ maxParticles: 10 });
             e.emitBurst(5, () => ({ life: 10, maxLife: 10 }));
             e.update(1 / 60);
-            expect(e.recycledThisFrame).toBe(0);
-            expect(e.activeCount).toBe(5);
+            assert.equal(e.recycledThisFrame, 0);
+            assert.equal(e.activeCount, 5);
         });
 
-        it('clear() is a scene reset, not churn — it does not inflate the metric', () => {
+        it('clear() is a scene reset, not churn - it does not inflate the metric', () => {
             const e = new Emitter({ maxParticles: 10 });
             e.emitBurst(5, () => ({ life: 10, maxLife: 10 }));
             e.update(1 / 60);
             e.clear();
-            expect(e.activeCount).toBe(0);
-            expect(e.recycledThisFrame).toBe(0);
+            assert.equal(e.activeCount, 0);
+            assert.equal(e.recycledThisFrame, 0);
         });
     });
 
     describe('emitBurst() return value', () => {
         it('reports how many actually spawned', () => {
             const e = new Emitter({ maxParticles: 10 });
-            expect(e.emitBurst(4, alive)).toBe(4);
+            assert.equal(e.emitBurst(4, alive), 4);
         });
 
         it('reports the short count when the pool saturates', () => {
             const e = new Emitter({ maxParticles: 3 });
-            expect(e.emitBurst(10, alive)).toBe(3);
+            assert.equal(e.emitBurst(10, alive), 3);
         });
     });
 });
-

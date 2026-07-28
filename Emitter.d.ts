@@ -101,6 +101,9 @@ export interface EmitterOptions {
 }
 
 /** Validate + normalize a zone. Throws on a malformed one. Returns a fresh, mutable object. */
+/** Package version. In three-place sync with package.json and CHANGELOG.md. */
+export declare const VERSION: string;
+
 export declare function normalizeZone(zone: EmissionZone | null | undefined): EmissionZone | null;
 
 export declare class Emitter {

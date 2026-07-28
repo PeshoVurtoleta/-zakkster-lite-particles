@@ -20,6 +20,9 @@
 import ObjectPool from 'lite-object-pool';
 import { Random } from '@zakkster/lite-random';
 
+/** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
+export const VERSION = '1.1.1';
+
 const TAU = Math.PI * 2;
 
 /** Zone kinds, and how many rng.next() draws each consumes per particle. */
