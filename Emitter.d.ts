@@ -15,7 +15,11 @@ export interface Particle {
     /** Life at birth. `life / maxLife` is the normalized life passed to draw(). */
     maxLife: number;
     size: number;
-    /** Attach your own colors / sprites / metadata. */
+    /**
+     * The ONE escape hatch for custom state (colours, sprites, metadata). Any field
+     * outside this schema must live here: `emit()` throws on an unknown top-level key,
+     * and particles are sealed, so a stray property cannot be welded on elsewhere.
+     */
     data: unknown;
 }
 
@@ -100,10 +104,18 @@ export interface EmitterOptions {
     random?: PRNG | null;
 }
 
-/** Validate + normalize a zone. Throws on a malformed one. Returns a fresh, mutable object. */
 /** Package version. In three-place sync with package.json and CHANGELOG.md. */
 export declare const VERSION: string;
 
+/**
+ * The determinism contract: rng.next() draws consumed per particle by each zone
+ * kind. Invariant for a zone's whole life -- a `ring` always draws 2 (perimeter and
+ * annulus alike), so mutating `innerRadius` cannot desync a seeded replay. A seeded
+ * stream advances by exactly `ZONE_DRAWS[zone.type]` per emitted particle. Frozen.
+ */
+export declare const ZONE_DRAWS: Readonly<{ point: 0; line: 1; rect: 2; ring: 2 }>;
+
+/** Validate + normalize a zone. Throws on a malformed one. Returns a fresh, mutable object. */
 export declare function normalizeZone(zone: EmissionZone | null | undefined): EmissionZone | null;
 
 export declare class Emitter {
@@ -135,7 +147,15 @@ export declare class Emitter {
     /** Swap the emission zone at runtime. `null` restores raw config x/y. */
     setZone(zone: EmissionZone | null): void;
 
-    /** Spawn one particle. Returns it, or `null` if the pool is full. */
+    /**
+     * Spawn one particle. Returns it, or `null` when it cannot be spawned.
+     *
+     * Config keys must be particle fields — an unknown key **throws** a `TypeError`
+     * (put custom colours/sprites/metadata on `data`). `life`/`maxLife` are coupled
+     * (give either and the other mirrors it); an effective non-positive or non-finite
+     * lifespan returns `null` rather than a dead-on-arrival particle. Returns `null`
+     * when the pool is full.
+     */
     emit(config?: Partial<Particle>): Particle | null;
 
     /**
@@ -144,6 +164,10 @@ export declare class Emitter {
      * config object. Pool capacity is checked BEFORE `initFn` runs, so a saturated
      * pool consumes no rng draw for a particle it cannot emit. A set zone supplies
      * the base x/y first; `initFn` runs after and can override.
+     *
+     * The RAW path: `initFn` writes onto a sealed particle (a stray key throws — use
+     * `data`), and the lifecycle is yours to set (`life > 0`); unlike `emit` it does
+     * not validate. `draw()` still clamps normalizedLife regardless.
      * Returns how many actually spawned (< count when the pool saturates).
      */
     emitEach(count: number, initFn: (particle: Particle, i: number) => void): number;
@@ -163,7 +187,7 @@ export declare class Emitter {
     /** dt is in SECONDS. From rAF: `update((now - last) / 1000)`. */
     update(dt: number): void;
 
-    /** normalizedLife is 1.0 at birth, 0.0 at death. */
+    /** normalizedLife is 1.0 at birth, 0.0 at death — always clamped to [0,1], never NaN. */
     draw<C>(ctx: C, renderCallback: (ctx: C, particle: Particle, normalizedLife: number) => void): void;
 
     /** Kill all particles instantly. */

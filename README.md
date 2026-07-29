@@ -22,6 +22,7 @@ Most particle libraries on npm ship with a Canvas or WebGL renderer baked in. Th
 - **GC-free** — `update()` and `draw()` allocate **0 bytes per call** at every particle count (measured; enforced by a torture gate). Particles are preallocated in an inline dense free-list and recycled. No `new` in your game loop, no GC pauses at 60fps
 - **Bring your own renderer** — the `draw()` callback gives you the particle and a normalized life value. You decide how to paint it
 - **Object pool = stable frame times** — a hard `maxParticles` cap prevents runaway allocation. Pool full? `emit()` returns `null`. No crash, no stutter
+- **A pinned contract, no silent wrong answers** — `emit()` throws on an unknown field (custom state goes on `data`) and rejects an invalid lifecycle to `null`; `normalizedLife` is always in `[0,1]`, never NaN; a recycled particle never wears a dead one's colour; a seeded replay is stable even as you mutate a ring's `innerRadius`
 - **Real physics** — gravity, frame-independent drag, velocity integration. Not just "move dots randomly"
 - **Bounds culling** — particles that leave the screen are automatically recycled instead of computing invisible physics
 - **Designed for real games, not demos** — born in a production scratch card game with 500+ simultaneous particles
@@ -112,11 +113,11 @@ function frame(now) {
 
 | Method | Description |
 |--------|-------------|
-| `.emit(config)` | Spawn one particle. Returns it, or `null` if pool is full. |
-| `.emitEach(count, initFn)` | Spawn many, **allocation-free**. `initFn(particle, index)` writes fields onto the particle directly. Capacity is checked before `initFn`, so a full pool burns no rng draw. Stops at pool limit. **Returns how many actually spawned.** |
+| `.emit(config)` | Spawn one particle. Returns it, or `null` if the pool is full **or the lifecycle is invalid** (see below). An unknown config key **throws** — custom state goes on `data`. |
+| `.emitEach(count, initFn)` | Spawn many, **allocation-free**. `initFn(particle, index)` writes fields onto the particle directly. Capacity is checked before `initFn`, so a full pool burns no rng draw. Raw path: writes a sealed particle (stray key throws) and you own the lifecycle. Stops at pool limit. **Returns how many actually spawned.** |
 | `.emitBurst(count, configFn)` | **Deprecated (v1.2.0, removed in v2.0.0)** — use `.emitEach`. `configFn(index)` returns a config object per particle (one allocation each). Stops at pool limit. **Returns how many actually spawned.** |
-| `.update(dt)` | Physics tick. **dt in seconds.** |
-| `.draw(ctx, callback)` | Iterate for rendering. Callback: `(ctx, particle, normalizedLife)`. |
+| `.update(dt)` | Physics tick. **dt in seconds.** Phase order (pinned): decrement life → early death → integrate → bounds cull → `onUpdate` hook. |
+| `.draw(ctx, callback)` | Iterate for rendering. Callback: `(ctx, particle, normalizedLife)`, where `normalizedLife` is always in **`[0,1]`** (clamped, never NaN). |
 | `.clear()` | Kill all particles instantly. Great for scene resets. |
 | `.destroy()` | Destroy emitter and pool. Idempotent. |
 | `.activeCount` | Number of alive particles (getter). |
@@ -133,10 +134,10 @@ function frame(now) {
 | `vx`, `vy` | `0` | Velocity (pixels/second) |
 | `gravity` | `0` | Downward acceleration (pixels/s²) |
 | `drag` | `1` | Velocity damping per frame (1 = none, 0.9 = 10% loss) |
-| `life` | `0` | Remaining life in seconds |
-| `maxLife` | `1` | Initial life (for computing `normalizedLife`) |
+| `life` | `0` | Remaining life in seconds. **`emit()` requires `life > 0`** — a missing or non-positive life returns `null` rather than a dead-on-arrival particle. |
+| `maxLife` | `1` | Life at birth. Defaults to `life` when only `life` is given, so `normalizedLife` starts at exactly 1.0. |
 | `size` | `1` | For use in your render callback |
-| `data` | `null` | Attach anything — colors, sprites, custom state |
+| `data` | `null` | **The one place for custom state** — colors, sprites, metadata. `emit()` throws on any other top-level key, and particles are sealed, so this is where it goes. |
 
 ## Emission Zones (v1.1.0)
 
@@ -162,16 +163,18 @@ emitter.emitBurst(30, (i) => ({
 |------|-------|-----------|
 | `{ type: 'point', x, y }` | Single origin | 0 |
 | `{ type: 'line', x1, y1, x2, y2 }` | Along a segment — rain, waterfalls, top-of-screen spawns | 1 |
-| `{ type: 'ring', x, y, radius }` | **On the perimeter** — shockwaves, explosions | 1 |
+| `{ type: 'ring', x, y, radius }` | **On the perimeter** — shockwaves, explosions | 2 |
 | `{ type: 'ring', x, y, radius, innerRadius }` | Filled annulus, uniform **by area** | 2 |
 | `{ type: 'rect', x, y, width, height }` | Area — ground smoke, magic circles, crowds | 2 |
+
+The draw count is the determinism contract, exported as `ZONE_DRAWS` — a seeded stream advances by exactly `ZONE_DRAWS[zone.type]` per emitted particle. A `ring` always draws **2** (perimeter and annulus alike; the perimeter draws the radius sample and discards it), so its rng footprint is constant and mutating `innerRadius` can never desync a replay.
 
 A few things worth knowing:
 
 - **`ring` means the perimeter by default.** That's what a shockwave is. Add `innerRadius` and it becomes a filled annulus — sampled uniformly *by area*, not by radius. (The naive `innerRadius + u * (radius - innerRadius)` is uniform in *radius*, which piles particles toward the centre and leaves the rim looking thin. `radius: 10, innerRadius: 0` puts 50% of particles inside r=7.07, not 71%.)
 - **Config `x`/`y` still win.** The zone provides the base; anything your `configFn` returns is applied on top. Use it to offset, or to override entirely.
 - **A malformed zone throws.** A typo'd zone that quietly emits everything at `(0, 0)` is the worst failure mode a visual library can have.
-- **Zones are mutable.** `emitter.zone.x = mouseX` is the supported way to move an emitter. Use `setZone()` to change *shape* — it re-validates.
+- **Zones are mutable — position live, dimensions via `setZone()`.** `emitter.zone.x = mouseX` is the supported way to *move* an emitter. To change a *dimension* (`radius`, `innerRadius`, `width`, `height`, line endpoints), use `setZone()`, which re-validates — a raw in-place dimension write skips validation (e.g. `innerRadius > radius` would sample `NaN`). It no longer breaks replay (a ring's draw count is constant now), but it can still emit a malformed shape.
 - **Bounds culling still applies.** Particles born inside a `rect` that lies outside `bounds` are recycled on the first `update()`.
 
 ---

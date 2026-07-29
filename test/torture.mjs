@@ -34,6 +34,12 @@
  *     Phase E  mixed loop   -- 200k mixed emit/update/draw under measureOps with
  *                              stabilize:'deep', gated at maxArrayBuffersGrowth:0
  *                              and maxMajor:0. No steady-state growth of any kind.
+ *     Phase F  degenerate   -- every degenerate input has a PINNED answer (v1.3.0,
+ *                              findings LP-04/LP-05): an invalid lifecycle is rejected
+ *                              to null and never inflates recycledThisFrame;
+ *                              normalizedLife is always finite in [0,1]; and NaN
+ *                              dt/gravity/drag plus degenerate bounds neither throw
+ *                              nor leak a NaN to the normalizedLife callback.
  *
  * Replay a Phase A/B corpus with its printed seed:
  *
@@ -368,14 +374,89 @@ function phaseE() {
 }
 
 // ---------------------------------------------------------------------------
-// Throughput note (not a gate): the HOT PATH ledger wants update()@1k on record.
+// Phase F -- degenerate values (v1.3.0, findings LP-04/LP-05). Not an allocation
+// gate: it pins a defined answer for each degenerate input so none is a silent
+// wrong answer. Needs no profiler; runs regardless of --expose-gc.
+// ---------------------------------------------------------------------------
+function phaseF() {
+    // (1) Invalid lifecycle -> emit returns null, takes no slot, no phantom churn.
+    const e = new Emitter({ maxParticles: 16 });
+    const rejected = [
+        { x: 1, y: 1 },                                    // no life at all
+        { life: 0 }, { life: -1 }, { life: NaN }, { life: Infinity }, { life: -Infinity },
+        { life: 1, maxLife: 0 }, { life: 1, maxLife: -2 },
+        { life: 1, maxLife: NaN }, { life: 1, maxLife: Infinity },
+    ];
+    for (const cfg of rejected) {
+        if (e.emit(cfg) !== null) fail('F', `emit(${JSON.stringify(cfg)}) should return null`);
+    }
+    if (e.activeCount !== 0) fail('F', `rejected emits took ${e.activeCount} slots, expected 0`);
+    e.update(1 / 60);
+    if (e.recycledThisFrame !== 0) fail('F', `rejected emits inflated recycledThisFrame to ${e.recycledThisFrame}`);
+    e.destroy();
+
+    // (2) normalizedLife is ALWAYS finite in [0,1], even for degenerate raw particles.
+    const nlMatrix = [
+        { life: 2, maxLife: 1 }, { life: 5, maxLife: 0 }, { life: NaN, maxLife: 1 },
+        { life: 1, maxLife: NaN }, { life: -3, maxLife: 1 }, { life: Infinity, maxLife: 1 },
+        { life: 0, maxLife: 0 }, { life: 1, maxLife: 1 },
+    ];
+    for (const fields of nlMatrix) {
+        const em = new Emitter({ maxParticles: 1 });
+        em.emitEach(1, (p) => { Object.assign(p, fields); });
+        let nl = null;
+        em.draw(null, (_c, _p, t) => { nl = t; });
+        if (!Number.isFinite(nl) || nl < 0 || nl > 1) {
+            fail('F', `normalizedLife=${nl} for ${JSON.stringify(fields)} -- expected finite in [0,1]`);
+        }
+        em.destroy();
+    }
+
+    // (3) Degenerate dt + NaN physics must not throw and must not leak NaN to the
+    // normalizedLife callback (position may be GIGO -- that is the caller's input).
+    for (const dt of [0, -1, NaN, 10, Infinity]) {
+        const em = new Emitter({ maxParticles: 8, bounds: { x: 0, y: 0, width: 100, height: 100 } });
+        em.emitEach(4, (p) => { p.x = 50; p.y = 50; p.life = 1; p.maxLife = 1; p.gravity = NaN; p.drag = NaN; p.size = NaN; });
+        try {
+            em.update(dt);
+            em.draw(null, (_c, _p, t) => { if (Number.isNaN(t)) throw new Error('NaN normalizedLife'); });
+        } catch (err) {
+            fail('F', `dt=${dt} with NaN gravity/drag/size: ${err.message}`);
+        }
+        em.destroy();
+    }
+
+    // (4) Degenerate bounds: zero-area culls a particle off the corner; NaN edges
+    // compare false, so they cull nothing (fail-open) -- both pinned, neither throws.
+    const zero = new Emitter({ maxParticles: 4, bounds: { x: 0, y: 0, width: 0, height: 0 } });
+    zero.emitEach(1, (p) => { p.x = 5; p.y = 5; p.life = 10; p.maxLife = 10; });
+    zero.update(1 / 60);
+    if (zero.activeCount !== 0) fail('F', `zero-area bounds left ${zero.activeCount} alive, expected (5,5) culled`);
+    zero.destroy();
+
+    const nan = new Emitter({ maxParticles: 4, bounds: { x: NaN, y: NaN, width: NaN, height: NaN } });
+    nan.emitEach(2, (p) => { p.x = 5; p.y = 5; p.life = 10; p.maxLife = 10; });
+    try { nan.update(1 / 60); } catch (err) { fail('F', `NaN-edge bounds threw: ${err.message}`); }
+    if (nan.activeCount !== 2) fail('F', `NaN bounds culled ${2 - nan.activeCount} (expected 0 -- NaN compares false)`);
+    nan.destroy();
+
+    log('  Phase F ok -- invalid lifecycle rejected to null (no phantom churn); normalizedLife ' +
+        'finite in [0,1] across the degenerate matrix; NaN dt/gravity/drag + degenerate bounds ' +
+        'neither throw nor leak NaN to the callback');
+}
+
+// ---------------------------------------------------------------------------
+// Throughput note (not a gate): the HOT PATH ledger wants update()@1k and (since
+// v1.3.0's normalizedLife clamp) draw()@1k on record.
 // ---------------------------------------------------------------------------
 function throughputNote() {
     const e = new Emitter({ maxParticles: 1000, seed: SEED });
     e.emitEach(1000, (p) => { p.life = 1e9; p.maxLife = 1e9; p.vx = 1; p.vy = 1; p.gravity = 10; p.drag = 0.99; });
-    const r = measureOps(() => e.update(1 / 6000), { ops: 200000, warmup: 20000, source: 'gc' });
+    const ru = measureOps(() => e.update(1 / 6000), { ops: 200000, warmup: 20000, source: 'gc' });
+    const rd = measureOps(() => e.draw(null, noop), { ops: 200000, warmup: 20000, source: 'gc' });
     e.destroy();
-    log(`  update()@1k throughput -- ${(r.opsPerSec / 1e6).toFixed(2)} M ops/s (informational)`);
+    log(`  throughput -- update()@1k ${(ru.opsPerSec / 1e6).toFixed(2)} M ops/s; ` +
+        `draw()@1k (clamped normalizedLife) ${(rd.opsPerSec / 1e6).toFixed(2)} M ops/s (informational)`);
 }
 
 async function main() {
@@ -385,6 +466,7 @@ async function main() {
         ['C-controls', phaseC],
         ['D-burst', phaseD],
         ['E-mixed', phaseE],
+        ['F-degenerate', phaseF],
         ['throughput', throughputNote],
     ];
     for (const [name, run] of phases) {

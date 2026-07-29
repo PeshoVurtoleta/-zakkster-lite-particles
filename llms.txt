@@ -10,6 +10,9 @@ npm install @zakkster/lite-particles
 
 ## Exports
 - `Emitter` — Class
+- `normalizeZone(zone)` — Function (validate + normalize a zone; throws on a malformed one)
+- `ZONE_DRAWS` — frozen record `{ point: 0, line: 1, rect: 2, ring: 2 }`: rng draws per particle by zone type, the determinism contract
+- `VERSION` — string
 
 ## Constructor
 `new Emitter({ maxParticles?, onUpdate?, bounds? })`
@@ -18,11 +21,11 @@ npm install @zakkster/lite-particles
 - `bounds: { x, y, width, height }` — Off-screen culling rectangle
 
 ## API
-- `.emit(config): particle | null` — Spawn one particle. Config: `{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }`. Returns null if pool full.
-- `.emitEach(count, initFn)` — Spawn multiple, allocation-free. `initFn(particle, index)` writes fields onto the particle directly (no config object). Capacity is checked before initFn, so a full pool burns no rng draw. Returns how many spawned.
+- `.emit(config): particle | null` — Spawn one particle. Config keys must be particle fields `{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }`; an UNKNOWN key THROWS a TypeError (custom colours/sprites/metadata go on `data`). `life`/`maxLife` are coupled (give either, the other mirrors it); an effective `life <= 0`, `maxLife <= 0`, or non-finite value returns null (no dead-on-arrival particle). Returns null if the pool is full.
+- `.emitEach(count, initFn)` — Spawn multiple, allocation-free. `initFn(particle, index)` writes fields onto the particle directly (no config object). Capacity is checked before initFn, so a full pool burns no rng draw. RAW path: writes a sealed particle (a stray key throws) and the caller owns the lifecycle (set life > 0); it does not validate like emit. Returns how many spawned.
 - `.emitBurst(count, configFn)` — DEPRECATED since v1.2.0 (removed in v2.0.0); use `.emitEach`. `configFn(index)` returns a config object per particle (one allocation each).
 - `.update(dt)` — Core physics tick. **dt must be in SECONDS** (divide rAF ms by 1000). Applies gravity, drag, velocity, bounds culling, then calls onUpdate hook.
-- `.draw(ctx, renderCallback)` — Iterate alive particles for rendering. `renderCallback(ctx, particle, normalizedLife)` where normalizedLife is 1.0 at birth → 0.0 at death.
+- `.draw(ctx, renderCallback)` — Iterate alive particles for rendering. `renderCallback(ctx, particle, normalizedLife)` where normalizedLife is 1.0 at birth → 0.0 at death, ALWAYS clamped to [0,1] and never NaN (even if a hook wrote a bad life/maxLife).
 - `.clear()` — Kill all particles instantly (scene reset).
 - `.activeCount` — Number of alive particles (getter).
 - `.destroy()` — Destroy pool. Idempotent.
@@ -64,12 +67,16 @@ emitter.draw(ctx, (ctx, p, t) => {
 new Emitter({ zone }) where zone is one of:
   { type: 'point', x, y }                        -> 0 rng draws
   { type: 'line', x1, y1, x2, y2 }               -> 1 rng draw
-  { type: 'ring', x, y, radius }                 -> ON THE PERIMETER (shockwave). 1 rng draw.
+  { type: 'ring', x, y, radius }                 -> ON THE PERIMETER (shockwave). 2 rng draws (v1.3.0).
   { type: 'ring', x, y, radius, innerRadius }    -> filled annulus, uniform BY AREA. 2 rng draws.
   { type: 'rect', x, y, width, height }          -> 2 rng draws
+As of v1.3.0 a ring ALWAYS draws 2 (perimeter draws the radius sample and discards it), so its
+rng footprint is constant and mutating innerRadius never desyncs a seeded replay. The per-zone
+counts are exported as ZONE_DRAWS; a seeded stream advances by exactly ZONE_DRAWS[zone.type]/particle.
 The zone supplies base x/y at emit time; config x/y from your configFn still override it.
 A malformed zone THROWS (it does not silently emit at 0,0). Zones are mutable objects --
-`emitter.zone.x = mouseX` moves the emitter; `setZone(z)` changes shape and re-validates.
+`emitter.zone.x = mouseX` moves the emitter (position is live-mutable); change a DIMENSION
+(radius/innerRadius/width/height/endpoints) via `setZone(z)`, which re-validates.
 Ring annulus sampling uses r = sqrt(ri^2 + u*(ro^2 - ri^2)), NOT ri + u*(ro-ri) -- the latter
 is uniform in radius and visibly bunches particles at the centre.
 Also exported: normalizeZone(zone).
@@ -126,3 +133,32 @@ the count). `.emitBurst` is deprecated in favour of it and removed in v2.0.0.
 ### Dependencies
 lite-object-pool was removed — replaced by an inline dense free-list. @zakkster/lite-random remains
 the one runtime dependency because `.random` re-exposes its whole API to config callbacks.
+
+## v1.3.0 — pin the contract
+
+Four silent wrong answers and a determinism footgun are now each a throw, a null, or a pinned test.
+
+### emit() schema (LP-01)
+Config keys must be particle fields; an unknown key THROWS a TypeError naming it and pointing at
+`data` (custom colours/sprites/metadata go there). Previously Object.assign welded arbitrary keys
+onto the pooled object permanently — reset() missed them, so a recycled particle inherited a dead
+one's colour. Particles are now Object.seal'd, so a hook or initFn that writes a stray key throws too
+(and the fixed hidden class is a V8 win — update()/draw() stay 0 B/call). Migrate:
+`emit({ color })` -> `emit({ data: { color } })`.
+
+### Lifecycle (LP-04, LP-05)
+emit() requires a valid lifecycle: life/maxLife are coupled (give either, the other mirrors it, so
+the "1.0 at birth" ramp is real), and an effective life<=0, maxLife<=0, or non-finite value returns
+null instead of a dead-on-arrival particle that inflated recycledThisFrame. normalizedLife is clamped
+to [0,1] in draw() and is NaN-safe (a NaN life/maxLife maps to 0). Immortal effects use a large finite
+life. emitEach is the raw path — it does not validate; the caller sets life.
+
+### Zone determinism (LP-06, LP-07)
+A ring always draws 2 rng values now, so innerRadius mutation can never desync a seeded replay.
+ZONE_DRAWS is exported and frozen as the enforced contract. ONE-TIME REPLAY CHANGE: a seed emitting
+through a PERIMETER ring produces a different stream than 1.2.x (2 draws/particle, not 1); annulus
+is unchanged. Dimension mutation goes through setZone(); position (x/y) stays live-mutable.
+
+### Phase order (LP-10)
+update() order is pinned (named test): decrement life -> early death -> integrate (gravity, drag,
+move) -> bounds cull -> onUpdate hook. Culling precedes the hook: a culled particle does not see it.

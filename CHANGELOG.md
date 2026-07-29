@@ -4,6 +4,77 @@ All notable changes to `@zakkster/lite-particles` are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.3.0] - 2026-07-29
+
+Pin the contract. Four behaviours that neither threw nor were pinned -- a recycled
+particle inheriting a dead one's colour, `normalizedLife` returning 2 and Infinity,
+a life-less particle dying before it moved, and a ring's `innerRadius` silently
+desyncing a seeded replay -- are now each either a thrown error, a `null` return, or
+a named test. No behaviour stays silent. The P1 allocation gates stay green: none of
+the new guards leaked into a hot body.
+
+### Changed
+
+- **`emit()` rejects an unknown config field (LP-01).** Passing a key outside the
+  particle schema (`{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }`) now
+  throws a `TypeError` naming the key and pointing at `data`. Previously
+  `Object.assign(p, config)` welded arbitrary keys onto the pooled object
+  permanently -- `reset()` never cleared them, so a recycled particle silently
+  inherited a dead one's `color`/`sprite`. **Custom state goes on `data`.** Migrate:
+  `emit({ color: 'red' })` -> `emit({ data: { color: 'red' } })`. Particles are now
+  `Object.seal`'d, so a hook or `initFn` that writes a stray key throws too (and the
+  fixed hidden class is a V8 win, not a cost -- torture Phase B still measures
+  0 B/call).
+- **`emit()` requires a valid lifecycle (LP-04, LP-05).** `life` and `maxLife` are
+  coupled -- give either and the other mirrors it, so the documented "1.0 at birth
+  -> 0.0 at death" ramp is real. An effective `life <= 0`, `maxLife <= 0`, or
+  non-finite value returns `null` (like a full pool) instead of spawning a
+  dead-on-arrival particle that expired on frame one and inflated
+  `recycledThisFrame`. `emit({ x, y })` with no `life` now returns `null`. Immortal
+  effects use a large finite `life`.
+- **`normalizedLife` is clamped to `[0,1]` (LP-04).** `draw()` now hands the render
+  callback `(maxLife > 0 && t > 0) ? min(1, t) : 0` where `t = life / maxLife` --
+  was `Math.max(0, life / maxLife)`, which returned 2 for `life:2,maxLife:1` and
+  Infinity for `maxLife:0`. The new form is also NaN-safe: a `NaN` life or maxLife
+  (from a hook or `initFn`) maps to 0, so no `NaN` ever reaches the callback.
+- **A `ring` zone always consumes 2 rng draws (LP-06).** The perimeter case
+  (`innerRadius === radius`) now draws the radius sample too and discards it, so a
+  ring's rng footprint is invariant and mutating `innerRadius` across the
+  perimeter/annulus boundary can no longer desync a seeded replay. **One-time replay
+  change:** a seed that emitted through a *perimeter* ring produces a different
+  stream than in 1.2.x (it now advances 2 draws/particle, not 1). The annulus stream
+  is unchanged.
+
+### Added
+
+- **`ZONE_DRAWS`** -- exported and frozen (LP-07). The per-zone rng-draw table
+  (`{ point: 0, line: 1, rect: 2, ring: 2 }`) is now the *enforced* determinism
+  contract: a seeded stream advances by exactly `ZONE_DRAWS[zone.type]` per emitted
+  particle, asserted in tests. It was previously declared and never referenced.
+- **`decisions/0004-emit-schema-masking.md`**, **`0005-lifecycle-contract.md`**,
+  **`0006-zone-determinism.md`** -- the three P2 records.
+- **Torture Phase F** -- a degenerate-value matrix (`life`/`maxLife`/`size`/`dt`/
+  `gravity`/`drag`/`bounds` of 0, negative, NaN, Infinity) with a pinned answer for
+  each: invalid lifecycle rejected to `null`, `normalizedLife` finite in `[0,1]`,
+  and no `NaN` or throw escaping. The throughput note now records `draw()@1k` too.
+
+### Notes
+
+- **Zone mutation boundary.** A zone's *position* (`x`/`y`) is live-mutable -- that
+  is how you make it follow the mouse. A *dimension* (`radius`, `innerRadius`,
+  `width`, `height`, line endpoints) should change through `setZone()`, which
+  re-validates; a raw in-place dimension write skips validation (e.g.
+  `innerRadius > radius` would sample `NaN`). Documented, not hard-locked -- see
+  `decisions/0006` for why a partial freeze was rejected.
+- **`update()` phase order is pinned (LP-10).** Decrement life, early-death,
+  integrate (gravity, drag, move), bounds cull, `onUpdate` hook -- culling precedes
+  the hook deliberately. A named test now guards the order; no code moved.
+- **`emitEach` is the raw path.** It writes directly onto a sealed particle and does
+  not validate the lifecycle (the caller owns it), keeping it allocation-free. The
+  `draw()` clamp still protects `normalizedLife` on that path.
+- P1's allocation gates (torture Phase B/E, 0 B/call) remain green with the `draw()`
+  clamp and the seal in place.
+
 ## [1.2.0] - 2026-07-29
 
 Make "GC-free" true. On 1.1.x, `update()` allocated ~331 B/call and `draw()`

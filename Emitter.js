@@ -9,6 +9,11 @@
  * IMPORTANT: dt is in SECONDS (not milliseconds).
  * If using requestAnimationFrame, divide by 1000: emitter.update(dt / 1000)
  *
+ * v1.3.0 — pin the contract: emit() throws on an unknown config field (custom state
+ *          lives in .data) and rejects an invalid lifecycle to null instead of
+ *          spawning a dead-on-arrival particle; normalizedLife is clamped to [0,1];
+ *          a ring zone always draws 2 rng values, so innerRadius can never desync a
+ *          seeded replay (findings LP-01/04/05/06/07/10). Particles are Object.seal'd.
  * v1.2.0 — GC-free made true: update()/draw() allocate 0 B/call at every particle
  *          count (finding LP-02/LP-03), and emitEach() is an allocation-free burst.
  * v1.1.0 — emission zones, seeded determinism, recycledThisFrame.
@@ -26,9 +31,20 @@
 import { Random } from '@zakkster/lite-random';
 
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = '1.2.0';
+export const VERSION = '1.3.0';
 
 const TAU = Math.PI * 2;
+
+/**
+ * The particle schema — the only fields emit() will copy from a config object.
+ * A key outside this set is rejected (see emit()): custom colours / sprites /
+ * metadata belong on `data`, never welded onto the pooled particle, where reset()
+ * would miss them and a recycled particle would inherit a dead one's state (LP-01).
+ */
+const SCHEMA_KEYS = new Set([
+    'x', 'y', 'vx', 'vy', 'gravity', 'drag', 'life', 'maxLife', 'size', 'data',
+]);
+const SCHEMA_FIELDS = '{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }';
 
 /**
  * Inline dense free-list — the O(1) pool that lite-object-pool used to provide,
@@ -85,8 +101,17 @@ class ParticlePool {
     }
 }
 
-/** Zone kinds, and how many rng.next() draws each consumes per particle. */
-const ZONE_DRAWS = { point: 0, line: 1, rect: 2, ring: 1 }; // ring: 2 when it is an annulus
+/**
+ * The determinism contract: how many rng.next() draws each zone kind consumes per
+ * particle. This footprint is INVARIANT for a zone's whole life — a `ring` always
+ * draws 2 (perimeter and annulus alike; the perimeter draws the radius sample and
+ * discards it), so mutating `innerRadius` across the perimeter/annulus boundary can
+ * never desync a seeded replay (LP-06). Exported and asserted (LP-07): a seeded
+ * stream advances by exactly ZONE_DRAWS[zone.type] per emitted particle.
+ *
+ * Frozen: this is a shared contract, not a scratch object.
+ */
+export const ZONE_DRAWS = Object.freeze({ point: 0, line: 1, rect: 2, ring: 2 });
 
 const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
 
@@ -95,8 +120,13 @@ const isNum = (v) => typeof v === 'number' && Number.isFinite(v);
  * silently emitting at (0, 0) — a typo'd zone that quietly does nothing is the
  * worst possible failure mode for a visual library.
  *
- * Returns a fresh, mutable object. Mutating `emitter.zone.x` is supported (that is
- * how you make a zone follow the mouse); use `setZone()` to change shape or type.
+ * Returns a fresh, mutable object. Mutating the POSITION live is supported — that is
+ * how you make a zone follow the mouse (`emitter.zone.x = mouseX`). Changing a
+ * DIMENSION (radius, innerRadius, width, height, or a line endpoint) should go through
+ * `setZone()`, which re-validates: a raw in-place dimension write skips validation
+ * (e.g. innerRadius > radius would sample NaN). It no longer breaks a seeded replay
+ * — a ring's rng footprint is constant now (see ZONE_DRAWS) — but it can still emit a
+ * malformed shape, so treat dimensions as setZone-only.
  */
 export function normalizeZone(zone) {
     if (zone === null || zone === undefined) return null;
@@ -179,12 +209,18 @@ export class Emitter {
         // prevents GC spikes; a full pool returns null from acquire() rather than growing.
         this.pool = new ParticlePool(
             maxParticles,
-            () => ({
+            // Object.seal pins the shape: a hook, initFn, or emit() config can only
+            // write EXISTING fields — welding a stray key (a leaked colour, LP-01)
+            // throws instead of surviving reset() onto a recycled particle. Sealing
+            // also fixes the hidden class, which is the deopt the pool exists to avoid;
+            // writes to existing keys on a sealed object are a V8 win, so the hot path
+            // is unaffected (torture Phase B proves 0 B/call and no throughput loss).
+            () => Object.seal({
                 x: 0, y: 0,
                 vx: 0, vy: 0,
                 gravity: 0, drag: 1,
                 life: 0, maxLife: 1,
-                size: 1, data: null, // attach custom colors/sprites/metadata
+                size: 1, data: null, // attach custom colors/sprites/metadata HERE
             }),
             (p) => {
                 p.x = p.y = 0;
@@ -264,37 +300,81 @@ export class Emitter {
             return;
         }
 
-        // ring
+        // ring — ALWAYS two draws (LP-06), theta then a radius sample `u`. Drawing `u`
+        // even on the perimeter (ri === ro), where it is discarded, keeps a ring's rng
+        // footprint invariant: theta is draw #1 and `u` is draw #2 in BOTH branches, so
+        // mutating innerRadius across the perimeter/annulus boundary shifts NO later
+        // draw and a seeded replay stays in sync (see ZONE_DRAWS, decisions/0006).
         const theta = rng.next() * TAU;
+        const u = rng.next();
         const ro = z.radius;
         const ri = z.innerRadius;
-        let r;
-        if (ri === ro) {
-            r = ro; // perimeter — the shockwave case, 1 draw
-        } else {
-            // Uniform BY AREA. The naive `ri + rng() * (ro - ri)` is uniform in radius,
-            // which piles particles up toward the centre — an annulus emitter would look
-            // visibly dense in the middle and thin at the rim.
-            r = Math.sqrt(ri * ri + rng.next() * (ro * ro - ri * ri));
-        }
+        // Perimeter: r = ro (the shockwave case). Annulus: uniform BY AREA. The naive
+        // `ri + u * (ro - ri)` is uniform in radius, which piles particles toward the
+        // centre — an annulus emitter would look dense in the middle and thin at the rim.
+        const r = (ri === ro) ? ro : Math.sqrt(ri * ri + u * (ro * ro - ri * ri));
         p.x = z.x + Math.cos(theta) * r;
         p.y = z.y + Math.sin(theta) * r;
     }
 
     /**
-     * Spawn a single particle. Returns the particle, or null if the pool is full.
+     * Spawn a single particle. Returns the particle, or `null` when it cannot be
+     * spawned — the pool is full, or the lifecycle is invalid (see below).
      *
-     * When a zone is set it supplies the base x/y; anything your config returns is
+     * When a zone is set it supplies the base x/y; anything your config assigns is
      * applied on top, so `config.x` still wins if you want to override or offset.
      *
-     * @param {Object} [config] - Properties to assign (x, y, vx, vy, life, ...)
+     * CONTRACT (v1.3.0):
+     * - Config keys must be particle fields: {@link SCHEMA_FIELDS}. An unknown key
+     *   THROWS a TypeError naming it — a stray `color`/`sprite` welded onto the pooled
+     *   object would survive reset() and reappear on a recycled particle (LP-01).
+     *   Put custom colours / sprites / metadata on `data` (e.g. `{ data: {...} }`).
+     * - `life` and `maxLife` are coupled: give either and the other mirrors it, so the
+     *   documented "1.0 at birth -> 0.0 at death" ramp is real. An effective
+     *   `life <= 0`, `maxLife <= 0`, or non-finite value is an INVALID emission and
+     *   returns `null` (never a dead-on-arrival particle that inflates
+     *   recycledThisFrame, LP-05). Immortal effects use a large finite `life`.
+     *
+     * @param {Object} [config] - Fields to assign (x, y, vx, vy, life, maxLife, ...)
      */
     emit(config) {
         if (this._destroyed) return null;
+
+        let life;
+        let maxLife;
+        if (config !== null && config !== undefined) {
+            // LP-01: reject any non-schema key LOUDLY, BEFORE touching the pool.
+            for (const k in config) {
+                if (!SCHEMA_KEYS.has(k)) {
+                    throw new TypeError(
+                        `lite-particles: unknown particle field "${k}" in emit() config -- ` +
+                        `attach custom state to .data (e.g. emit({ data: { ${k}: ... } })). ` +
+                        `The schema is ${SCHEMA_FIELDS}.`,
+                    );
+                }
+            }
+            life = config.life;
+            maxLife = config.maxLife;
+        }
+
+        // LP-04/LP-05: resolve + validate the lifecycle BEFORE acquire(), so an invalid
+        // emission burns neither a pool slot nor an rng draw — it returns null exactly
+        // as a full pool does. Couple the fields, then fail closed on a non-positive or
+        // non-finite lifespan (undefined fails `> 0`, so a missing life is rejected too).
+        if (life === undefined) life = maxLife;
+        if (maxLife === undefined) maxLife = life;
+        if (!(life > 0) || !Number.isFinite(life)) return null;
+        if (!(maxLife > 0) || !Number.isFinite(maxLife)) return null;
+
         const p = this.pool.acquire();
         if (!p) return null;
         if (this.zone !== null) this._sampleZone(p);
-        return config ? Object.assign(p, config) : p;
+        if (config) Object.assign(p, config);
+        // Write the resolved pair — covers the mirrored-default case where the config
+        // supplied only one of the two.
+        p.life = life;
+        p.maxLife = maxLife;
+        return p;
     }
 
     /**
@@ -309,6 +389,13 @@ export class Emitter {
      *
      * When a zone is set it supplies the base x/y first; `initFn` runs after and can
      * override, mirroring `emit`'s "config wins" rule.
+     *
+     * This is the RAW path: `initFn` writes straight onto a sealed particle, so custom
+     * state must go on `data` (writing a stray key throws), and the LIFECYCLE IS YOURS
+     * — set a positive `life` (and `maxLife`). Unlike `emit`, this does not validate or
+     * reject a bad lifespan; a particle left with `life <= 0` simply expires on the next
+     * update(). Use `emit` when you want that checked. `draw()` still clamps
+     * normalizedLife to [0,1] regardless of what you write here.
      *
      * @param {number}   count  How many to spawn
      * @param {Function} initFn Receives (particle, index); writes fields onto the particle
@@ -359,6 +446,16 @@ export class Emitter {
      *
      * IMPORTANT: dt must be in SECONDS.
      * If using rAF timestamps: emitter.update((now - last) / 1000)
+     *
+     * PHASE ORDER (pinned — LP-10). Per particle, every frame:
+     *   1. decrement life (`life -= dt`)
+     *   2. early death: `life <= 0` -> release, skip the rest of this frame
+     *   3. integrate: gravity, then frame-independent drag, then position
+     *   4. bounds cull: outside `bounds` -> release
+     *   5. `onUpdate(particle, dt)` hook
+     * Culling deliberately precedes the hook: a particle culled this frame does NOT
+     * see its hook, and a hook cannot pull a culled particle back in bounds. This
+     * order is a contract (a named test pins it); a refactor must not reorder it.
      *
      * @param {number} dt - Delta time in seconds
      */
@@ -433,7 +530,12 @@ export class Emitter {
         const active = pool.active;
         for (let i = 0; i < active; i++) {
             const p = slots[i];
-            const normalizedLife = Math.max(0, p.life / p.maxLife);
+            // normalizedLife is CLAMPED to [0,1] (LP-04) and NaN-safe: guard maxLife<=0,
+            // and the `t > 0` test sends any NaN (from a NaN life/maxLife written by a
+            // hook or initFn) to 0, so no NaN reaches the render callback. One divide,
+            // two compares — measured neutral on the draw() hot path (torture Phase B).
+            const t = p.life / p.maxLife;
+            const normalizedLife = (p.maxLife > 0 && t > 0) ? (t < 1 ? t : 1) : 0;
             renderCallback(ctx, p, normalizedLife);
         }
     }

@@ -1,7 +1,8 @@
 import { describe, it, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Emitter, normalizeZone, VERSION } from '../Emitter.js';
+import { Emitter, normalizeZone, VERSION, ZONE_DRAWS } from '../Emitter.js';
+import { Random } from '@zakkster/lite-random';
 
 // toBeCloseTo parity (from the ported suite): pass when |expected - actual| < 10**-digits / 2.
 const closeTo = (actual, expected, digits = 2) =>
@@ -625,6 +626,213 @@ describe('lite-particles', () => {
         it('reports the short count when the pool saturates', () => {
             const e = new Emitter({ maxParticles: 3 });
             assert.equal(e.emitBurst(10, alive), 3);
+        });
+    });
+
+    // ==========================================================
+    //  v1.3.0 - LP-01: the emit() schema is a whitelist, particles are sealed
+    // ==========================================================
+
+    describe('emit() schema contract (LP-01)', () => {
+        it('throws on a config key outside the particle schema, naming it', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            assert.throws(
+                () => e.emit({ x: 1, y: 2, color: 'red', life: 1 }),
+                (err) => err instanceof TypeError && /color/.test(err.message) && /\.data/.test(err.message),
+            );
+        });
+
+        it('a rejected emit consumes no pool slot (it threw before acquire)', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            assert.throws(() => e.emit({ sprite: 'boom', life: 1 }));
+            assert.equal(e.activeCount, 0);
+        });
+
+        it('accepts custom state on data', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            const p = e.emit({ x: 1, life: 1, data: { color: 'red', sprite: 'boom' } });
+            assert.equal(p.data.color, 'red');
+        });
+
+        it('a recycled particle carries exactly the schema fields, no inherited key', () => {
+            const e = new Emitter({ maxParticles: 2 });
+            e.emit({ x: 1, life: 1, data: { color: 'red' } });
+            e.clear();
+            const p = e.emit({ x: 5, life: 1 });
+            assert.deepEqual(
+                Object.keys(p).sort(),
+                ['data', 'drag', 'gravity', 'life', 'maxLife', 'size', 'vx', 'vy', 'x', 'y'],
+            );
+            assert.equal(p.data, null); // no ghost value from the dead particle
+        });
+
+        it('particles are sealed, so a hook cannot weld a stray key on', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            const p = e.emit({ life: 1 });
+            assert.ok(Object.isSealed(p));
+            assert.throws(() => { 'use strict'; p.color = 'red'; }, TypeError);
+        });
+
+        it('emitEach writes to data fine, but a stray key throws (sealed raw path)', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            assert.doesNotThrow(() => e.emitEach(1, (p) => { p.life = 1; p.data = { color: 'red' }; }));
+            assert.throws(() => e.emitEach(1, (p) => { p.life = 1; p.color = 'red'; }), TypeError);
+        });
+    });
+
+    // ==========================================================
+    //  v1.3.0 - LP-04 / LP-05: lifecycle contract + normalizedLife in [0,1]
+    // ==========================================================
+
+    /** Draw one particle and return the normalizedLife handed to the callback. */
+    const normLifeOf = (e) => {
+        let nl;
+        e.draw(null, (_c, _p, t) => { nl = t; });
+        return nl;
+    };
+    /** Build a single particle with raw (possibly degenerate) fields via the emitEach path. */
+    const raw = (fields) => {
+        const e = new Emitter({ maxParticles: 1 });
+        e.emitEach(1, (p) => { Object.assign(p, fields); });
+        return e;
+    };
+
+    describe('lifecycle contract (LP-04 / LP-05)', () => {
+        it('couples maxLife to life when only life is given (ramp starts at 1.0)', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            const p = e.emit({ life: 5 });
+            assert.equal(p.maxLife, 5);
+            closeTo(normLifeOf(e), 1, 9);
+        });
+
+        it('couples life to maxLife when only maxLife is given', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            const p = e.emit({ maxLife: 3 });
+            assert.equal(p.life, 3);
+        });
+
+        it('returns null for a missing / non-positive / non-finite life', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            assert.equal(e.emit({ x: 1, y: 1 }), null);   // no life at all
+            assert.equal(e.emit({ life: 0 }), null);
+            assert.equal(e.emit({ life: -1 }), null);
+            assert.equal(e.emit({ life: NaN }), null);
+            assert.equal(e.emit({ life: Infinity }), null);
+            assert.equal(e.emit({ life: 1, maxLife: 0 }), null);
+            assert.equal(e.emit({ life: 1, maxLife: -2 }), null);
+            assert.equal(e.activeCount, 0); // none of them took a slot
+        });
+
+        it('normalizedLife is clamped to [0,1] across the degenerate matrix', () => {
+            closeTo(normLifeOf(raw({ life: 2, maxLife: 1 })), 1, 9);      // was 2
+            assert.equal(normLifeOf(raw({ life: 5, maxLife: 0 })), 0);    // was Infinity
+            assert.equal(normLifeOf(raw({ life: NaN, maxLife: 1 })), 0);  // no NaN to the callback
+            assert.equal(normLifeOf(raw({ life: 1, maxLife: NaN })), 0);
+            assert.equal(normLifeOf(raw({ life: -3, maxLife: 1 })), 0);
+            assert.equal(normLifeOf(raw({ life: Infinity, maxLife: 1 })), 1);
+            closeTo(normLifeOf(raw({ life: 0.25, maxLife: 1 })), 0.25, 9);
+        });
+
+        it('never lets a NaN reach the render callback', () => {
+            for (const fields of [{ life: NaN, maxLife: 1 }, { life: 1, maxLife: NaN }, { life: NaN, maxLife: NaN }]) {
+                assert.equal(Number.isNaN(normLifeOf(raw(fields))), false);
+            }
+        });
+
+        it('recycledThisFrame never counts a particle that was never emitted', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            for (let i = 0; i < 10; i++) e.emit({ x: i, y: 0 }); // all rejected (no life) -> null
+            e.update(1 / 60);
+            assert.equal(e.activeCount, 0);
+            assert.equal(e.recycledThisFrame, 0); // no phantom churn from dead-on-arrival particles
+        });
+    });
+
+    // ==========================================================
+    //  v1.3.0 - LP-06 / LP-07: the zone determinism contract (ZONE_DRAWS)
+    // ==========================================================
+
+    describe('zone determinism contract (LP-06 / LP-07)', () => {
+        it('ZONE_DRAWS is exported, frozen, and a ring is 2', () => {
+            assert.ok(Object.isFrozen(ZONE_DRAWS));
+            assert.deepEqual({ ...ZONE_DRAWS }, { point: 0, line: 1, rect: 2, ring: 2 });
+        });
+
+        // For each zone type, a seeded stream must advance by exactly ZONE_DRAWS[type]
+        // per emitted particle -- assert the STREAM POSITION against a fresh oracle.
+        const ZONES = {
+            point: { type: 'point', x: 0, y: 0 },
+            line: { type: 'line', x1: 0, y1: 0, x2: 10, y2: 10 },
+            rect: { type: 'rect', x: 0, y: 0, width: 10, height: 10 },
+            ring: { type: 'ring', x: 0, y: 0, radius: 10 },            // perimeter
+            ringAnnulus: { type: 'ring', x: 0, y: 0, radius: 10, innerRadius: 4 },
+        };
+        for (const [name, zone] of Object.entries(ZONES)) {
+            it(`${name} advances the stream by ZONE_DRAWS[${zone.type}] per particle`, () => {
+                const N = 6;
+                const e = new Emitter({ maxParticles: 20, seed: 42, zone });
+                e.emitEach(N, (p) => { p.life = 1; });
+                const ref = new Random(42);
+                for (let i = 0; i < ZONE_DRAWS[zone.type] * N; i++) ref.next();
+                assert.equal(e.random.getState(), ref.getState());
+            });
+        }
+
+        it('a ring draws 2 on the perimeter AND as an annulus (constant footprint)', () => {
+            const at = (innerRadius) => {
+                const e = new Emitter({ maxParticles: 20, seed: 7, zone: { type: 'ring', x: 0, y: 0, radius: 10, innerRadius } });
+                e.emitEach(5, (p) => { p.life = 1; });
+                return e.random.getState();
+            };
+            assert.equal(at(10), at(4)); // perimeter and annulus land at the same stream position
+        });
+
+        it('mutating innerRadius live across the boundary does NOT desync a seeded replay', () => {
+            const e = new Emitter({ maxParticles: 100, seed: 42, zone: { type: 'ring', x: 0, y: 0, radius: 10 } });
+            e.emitEach(2, (p) => { p.life = 1; }); // perimeter
+            e.zone.innerRadius = 3;                // flip to annulus mid-flight
+            e.emitEach(2, (p) => { p.life = 1; }); // annulus
+            const ref = new Random(42);
+            for (let i = 0; i < ZONE_DRAWS.ring * 4; i++) ref.next();
+            assert.equal(e.random.getState(), ref.getState());
+        });
+
+        it('perimeter particles still land exactly on the perimeter', () => {
+            const e = new Emitter({ maxParticles: 200, seed: 5, zone: { type: 'ring', x: 0, y: 0, radius: 10 } });
+            e.emitEach(200, (p) => { p.life = 1; });
+            for (const p of positions(e)) closeTo(Math.hypot(p.x, p.y), 10, 9);
+        });
+    });
+
+    // ==========================================================
+    //  v1.3.0 - LP-10: the update() phase order is pinned
+    // ==========================================================
+
+    describe('update() phase order (LP-10)', () => {
+        it('culls before the onUpdate hook - a culled particle does not see its hook', () => {
+            const hook = mock.fn();
+            const e = new Emitter({
+                maxParticles: 5,
+                onUpdate: hook,
+                bounds: { x: 0, y: 0, width: 100, height: 100 },
+            });
+            e.emit({ x: 50, y: 50, vx: 10000, vy: 0, life: 10 }); // integrates out of bounds this frame
+            e.update(1 / 60);
+            assert.equal(e.activeCount, 0);              // integrated, THEN culled
+            assert.equal(hook.mock.callCount(), 0);      // hook never ran for the culled particle
+        });
+
+        it('an in-bounds particle is integrated and DOES see the hook', () => {
+            const hook = mock.fn();
+            const e = new Emitter({
+                maxParticles: 5,
+                onUpdate: hook,
+                bounds: { x: 0, y: 0, width: 100, height: 100 },
+            });
+            const p = e.emit({ x: 50, y: 50, vx: 10, vy: 0, life: 10 });
+            e.update(0.1);
+            closeTo(p.x, 51, 6);                         // integrated (50 + 10*0.1)
+            assert.equal(hook.mock.callCount(), 1);      // survived the cull, hook ran
         });
     });
 });
