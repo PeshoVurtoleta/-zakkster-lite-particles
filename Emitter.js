@@ -9,6 +9,14 @@
  * IMPORTANT: dt is in SECONDS (not milliseconds).
  * If using requestAnimationFrame, divide by 1000: emitter.update(dt / 1000)
  *
+ * v1.4.0 — lifecycle hooks: onDeath(p) sub-emitter fires on life-expiry (a dying spark
+ *          can spawn embers), bounded by a per-particle generation cap that THROWS past
+ *          maxCascadeDepth; `curves` bakes easing functions into Float32Array LUTs read
+ *          via curve()/curveTable() (no Math in the draw path); follow(target) tracks a
+ *          moving object world-space (moves the zone origin, O(1)/frame). The pool is
+ *          now reset-on-acquire so a dying particle can be released BEFORE onDeath reads
+ *          it. lite-ease / lite-ease-lut / lite-lerp are devDeps only — the runtime bakes
+ *          and reads a plain table. See decisions/0007-0009.
  * v1.3.0 — pin the contract: emit() throws on an unknown config field (custom state
  *          lives in .data) and rejects an invalid lifecycle to null instead of
  *          spawning a dead-on-arrival particle; normalizedLife is clamped to [0,1];
@@ -31,7 +39,7 @@
 import { Random } from '@zakkster/lite-random';
 
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = '1.3.0';
+export const VERSION = '1.4.0';
 
 const TAU = Math.PI * 2;
 
@@ -58,6 +66,16 @@ const SCHEMA_FIELDS = '{ x, y, vx, vy, gravity, drag, life, maxLife, size, data 
  * already been visited), which is the whole reason update() can drop its `dead[]`
  * buffer. `slots` and `active` are read directly by update()/draw() so those loops
  * need no callback.
+ *
+ * RESET-ON-ACQUIRE (v1.4.0). The particle is cleared by acquire(), NOT by releaseAt().
+ * releaseAt() only swap-removes, so a just-released particle keeps its dying values
+ * until something reacquires that slot. This is what lets update() release a dying
+ * particle BEFORE firing onDeath(p): the hook still reads the particle's death x/y, a
+ * cap-exceeded throw leaves the pool already consistent, and a full pool's freed slot
+ * is immediately reusable by a 1:1 sub-emitter. Net allocation is unchanged — the reset
+ * merely moved from release-time to acquire-time (writes to existing sealed keys, 0 B).
+ * update()/draw() only ever read `[0, active)`, so stale values in the free region are
+ * never observed. See decisions/0007.
  */
 class ParticlePool {
     constructor(size, create, reset) {
@@ -68,26 +86,31 @@ class ParticlePool {
         for (let i = 0; i < size; i++) this.slots[i] = create();
     }
 
-    /** O(1). Returns a clean particle, or null when full. */
+    /** O(1). Returns a clean particle (reset on the way out), or null when full. */
     acquire() {
         if (this.active >= this.size) return null;
-        return this.slots[this.active++];
+        const p = this.slots[this.active++];
+        this._reset(p);
+        return p;
     }
 
-    /** O(1) swap-remove of the active particle at index `i`, then reset it. */
+    /**
+     * O(1) swap-remove of the active particle at index `i`. Does NOT reset — the
+     * released particle keeps its values (read by onDeath) until it is reacquired.
+     */
     releaseAt(i) {
         const slots = this.slots;
         const last = --this.active;
         const p = slots[i];
         slots[i] = slots[last];
         slots[last] = p;
-        this._reset(p);
     }
 
-    /** Reset every active particle and empty the active region. */
+    /**
+     * Empty the active region. Freed particles are reset lazily on reacquire, so this
+     * is just a pointer move — no per-particle work for a scene reset.
+     */
     releaseAll() {
-        const slots = this.slots;
-        for (let i = 0; i < this.active; i++) this._reset(slots[i]);
         this.active = 0;
     }
 
@@ -174,8 +197,12 @@ export class Emitter {
      * @param {Object}   options
      * @param {number}   [options.maxParticles=1000] Hard memory limit
      * @param {Function} [options.onUpdate]          Custom per-particle physics hook (particle, dt)
+     * @param {Function} [options.onDeath]           Sub-emitter hook (particle) fired on life-expiry (v1.4.0)
+     * @param {number}   [options.maxCascadeDepth=8] onDeath cascade cap; emit past it THROWS (v1.4.0)
      * @param {Object}   [options.bounds]            { x, y, width, height } for off-screen culling
      * @param {Object}   [options.zone]              Emission shape, sampled at emit time
+     * @param {Object}   [options.curves]           { name: (t)=>number } baked into Float32Array LUTs (v1.4.0)
+     * @param {number}   [options.curveSegments=256] LUT resolution per curve (v1.4.0)
      * @param {number}   [options.seed]              RNG seed. Same seed => same emission sequence.
      * @param {Object}   [options.random]            Inject your own PRNG. Any object with .next() -> [0,1).
      *                                               Wins over `seed`. Use this to bring a non-lite-random PRNG.
@@ -183,15 +210,41 @@ export class Emitter {
     constructor({
         maxParticles = 1000,
         onUpdate = null,
+        onDeath = null,
+        maxCascadeDepth = 8,
         bounds = null,
         zone = null,
+        curves = null,
+        curveSegments = 256,
         seed,
         random = null,
     } = {}) {
         this.onUpdate = onUpdate;
+        this.onDeath = onDeath;
         this.bounds = bounds;
         this.zone = normalizeZone(zone);
         this._destroyed = false;
+
+        // onDeath cascade guard (v1.4.0). `_emitGen` is the generation stamped onto a
+        // particle emitted RIGHT NOW: 0 for a normal emit, and (dying particle's _gen + 1)
+        // while inside _fireDeath(). emit() throws once it would exceed _maxCascadeDepth,
+        // so a runaway self-emitting effect fails loud instead of stalling the frame.
+        this._maxCascadeDepth = maxCascadeDepth;
+        this._emitGen = 0;
+
+        // follow(target) state (v1.4.0). World-space: we move the ZONE ORIGIN each
+        // update(), never the live particles. `_followX/_followY` remember the last
+        // origin so a line zone can be translated by delta.
+        this._follow = null;
+        this._followX = 0;
+        this._followY = 0;
+
+        // curves (v1.4.0): bake each easing fn into a Float32Array LUT once, here (cold),
+        // and pre-build the sampler closure so curve()/the draw path allocate nothing and
+        // call no Math.sin/pow. lite-ease supplies the fns in userland; we only read a table.
+        this._curveLuts = null;
+        this._curveFns = null;
+        if (curves !== null && curves !== undefined) this._bakeCurves(curves, curveSegments);
 
         if (random !== null && typeof random.next !== 'function') {
             throw new TypeError('lite-particles: options.random must expose a next() -> [0,1) method');
@@ -215,13 +268,21 @@ export class Emitter {
             // also fixes the hidden class, which is the deopt the pool exists to avoid;
             // writes to existing keys on a sealed object are a V8 win, so the hot path
             // is unaffected (torture Phase B proves 0 B/call and no throughput loss).
-            () => Object.seal({
-                x: 0, y: 0,
-                vx: 0, vy: 0,
-                gravity: 0, drag: 1,
-                life: 0, maxLife: 1,
-                size: 1, data: null, // attach custom colors/sprites/metadata HERE
-            }),
+            () => {
+                const p = {
+                    x: 0, y: 0,
+                    vx: 0, vy: 0,
+                    gravity: 0, drag: 1,
+                    life: 0, maxLife: 1,
+                    size: 1, data: null, // attach custom colors/sprites/metadata HERE
+                };
+                // `_gen` is the onDeath cascade generation (private, v1.4.0). NON-ENUMERABLE
+                // on purpose: it must not appear in Object.keys(p) / {...p}, so the public
+                // particle shape stays exactly the P2 schema. Writable (reset/emit set it),
+                // and the fixed hidden class is preserved for the hot path.
+                Object.defineProperty(p, '_gen', { value: 0, writable: true, enumerable: false, configurable: false });
+                return Object.seal(p);
+            },
             (p) => {
                 p.x = p.y = 0;
                 p.vx = p.vy = 0;
@@ -231,6 +292,7 @@ export class Emitter {
                 p.maxLife = 1;
                 p.size = 1;
                 p.data = null;
+                p._gen = 0;
             },
         );
     }
@@ -270,6 +332,147 @@ export class Emitter {
     setZone(zone) {
         if (this._destroyed) return;
         this.zone = normalizeZone(zone);
+    }
+
+    /**
+     * Bake a { name: (t)=>number } map of easing functions into Float32Array LUTs and
+     * pre-build one sampler closure per name. Cold — runs once at construction. The
+     * baked table is what the hot path reads: no Math.sin/pow, no per-frame closure.
+     */
+    _bakeCurves(curves, segments) {
+        if (typeof curves !== 'object') {
+            throw new TypeError('lite-particles: options.curves must be a { name: (t)=>number } object');
+        }
+        const seg = segments | 0;
+        if (!(seg >= 2)) throw new RangeError('lite-particles: curveSegments must be an integer >= 2');
+        const N1 = seg - 1;
+
+        const luts = {};
+        const fns = {};
+        for (const name in curves) {
+            const fn = curves[name];
+            if (typeof fn !== 'function') {
+                throw new TypeError(`lite-particles: curve "${name}" must be a (t)=>number function`);
+            }
+            const lut = new Float32Array(seg);
+            for (let j = 0; j < seg; j++) lut[j] = fn(j / N1);
+            luts[name] = lut;
+            // Sampler: clamp the ends, linearly interpolate between the two nearest
+            // samples inside. Pre-built ONCE here, so calling it per particle allocates
+            // nothing and evaluates no easing math — just a table read plus a lerp.
+            fns[name] = (t) => {
+                if (t <= 0) return lut[0];
+                if (t >= 1) return lut[N1];
+                const x = t * N1;
+                const i = x | 0;
+                return lut[i] + (lut[i + 1] - lut[i]) * (x - i);
+            };
+        }
+        this._curveLuts = luts;
+        this._curveFns = fns;
+    }
+
+    /**
+     * The baked sampler for a named curve: `emitter.curve('size')(normalizedLife)` returns
+     * the eased value with no easing math on the hot path. HOIST it out of your render loop
+     * (`const sizeCurve = emitter.curve('size')`) — it is a stable closure, same reference
+     * every call. Throws if the name was not configured (fail closed).
+     * @param {string} name
+     * @returns {(t:number)=>number}
+     */
+    curve(name) {
+        const fn = this._curveFns && this._curveFns[name];
+        if (!fn) throw new TypeError(`lite-particles: no curve named "${name}" (configure it via new Emitter({ curves }))`);
+        return fn;
+    }
+
+    /**
+     * The raw Float32Array LUT behind a named curve, for callers who want a bare index
+     * (`lut[(t * (lut.length - 1)) | 0]`) instead of the interpolating sampler. Throws if
+     * the name was not configured.
+     * @param {string} name
+     * @returns {Float32Array}
+     */
+    curveTable(name) {
+        const lut = this._curveLuts && this._curveLuts[name];
+        if (!lut) throw new TypeError(`lite-particles: no curve named "${name}" (configure it via new Emitter({ curves }))`);
+        return lut;
+    }
+
+    /**
+     * Make the emission zone track a moving target (world-space). Each update() reads
+     * `target.x` / `target.y` and moves the ZONE ORIGIN there — two property reads,
+     * O(1), never per-particle. Particles already emitted stay where they were born
+     * (a comet trail), so this does NOT rigidly drag the whole system.
+     *
+     * Pass `null` to stop following. Requires a zone: following with nothing to move is
+     * a silent no-op, so it THROWS instead (fail loud). If the target is later set to a
+     * non-object, or its x/y go non-finite (detached mid-flight), update() simply skips
+     * the move that frame — the zone stays put and no NaN is written.
+     *
+     * @param {{x:number,y:number}|null} target
+     */
+    follow(target) {
+        if (this._destroyed) return;
+        if (target === null || target === undefined) {
+            this._follow = null;
+            return;
+        }
+        if (this.zone === null) {
+            throw new TypeError('lite-particles: follow(target) needs a zone to move -- set one via new Emitter({ zone }) or setZone() first');
+        }
+        this._follow = target;
+        // Seed the delta reference from the current zone origin so a line zone's first
+        // tracked frame translates from where it is now, not from (0,0).
+        const z = this.zone;
+        this._followX = z.type === 'line' ? z.x1 : z.x;
+        this._followY = z.type === 'line' ? z.y1 : z.y;
+    }
+
+    /**
+     * Move the zone origin to the followed target. Called at the TOP of update(), before
+     * the particle loop, so this frame's physics and any post-update emit see the new
+     * origin. No-op (fail closed, no NaN) when the target is missing or non-finite.
+     */
+    _trackFollow() {
+        const t = this._follow;
+        if (t === null || typeof t !== 'object') return;
+        const tx = t.x;
+        const ty = t.y;
+        if (!(typeof tx === 'number' && Number.isFinite(tx) &&
+              typeof ty === 'number' && Number.isFinite(ty))) return;
+
+        const z = this.zone;
+        if (z === null) return;
+        if (z.type === 'line') {
+            // Translate all four endpoints by the delta from the last tracked origin.
+            const dx = tx - this._followX;
+            const dy = ty - this._followY;
+            z.x1 += dx; z.y1 += dy;
+            z.x2 += dx; z.y2 += dy;
+        } else {
+            z.x = tx;
+            z.y = ty;
+        }
+        this._followX = tx;
+        this._followY = ty;
+    }
+
+    /**
+     * Fire the onDeath sub-emitter for an expired particle. COLD — only runs on a death
+     * with a hook set, so its try/finally (which would deopt update()'s hot loop) is
+     * isolated here. Stamps the ambient generation so any emit() the hook makes marks its
+     * newborns one level deeper, and always clears it — even when emit() throws the
+     * cascade-cap RangeError. The dying particle was already releaseAt()'d by update(),
+     * so it still holds its death x/y here and the pool is consistent if this throws.
+     */
+    _fireDeath(p) {
+        this._emitGen = p._gen + 1;
+        try {
+            this.onDeath(p);
+        } finally {
+            this._emitGen = 0;
+        }
     }
 
     /**
@@ -334,6 +537,9 @@ export class Emitter {
      *   `life <= 0`, `maxLife <= 0`, or non-finite value is an INVALID emission and
      *   returns `null` (never a dead-on-arrival particle that inflates
      *   recycledThisFrame, LP-05). Immortal effects use a large finite `life`.
+     * - When called from inside an `onDeath` sub-emitter (v1.4.0), the newborn is tagged
+     *   one generation deeper. Past `maxCascadeDepth` this THROWS a `RangeError` — an
+     *   unbounded self-emitting cascade is a bug, surfaced loud like the unknown-key case.
      *
      * @param {Object} [config] - Fields to assign (x, y, vx, vy, life, maxLife, ...)
      */
@@ -366,6 +572,18 @@ export class Emitter {
         if (!(life > 0) || !Number.isFinite(life)) return null;
         if (!(maxLife > 0) || !Number.isFinite(maxLife)) return null;
 
+        // onDeath cascade cap (v1.4.0). `_emitGen` is 0 for a normal emit and
+        // (dying particle's _gen + 1) inside _fireDeath(). Past the cap, THROW — an
+        // unbounded self-emitting effect is a bug, surfaced loud like emit()'s
+        // unknown-key throw, not silently dropped into a frame-time cliff. Checked
+        // BEFORE acquire() so the offending emit burns no slot and no rng draw.
+        if (this._emitGen > this._maxCascadeDepth) {
+            throw new RangeError(
+                `lite-particles: onDeath cascade exceeded maxCascadeDepth (${this._maxCascadeDepth}) -- ` +
+                `bound your sub-emitter's generations or raise maxCascadeDepth.`,
+            );
+        }
+
         const p = this.pool.acquire();
         if (!p) return null;
         if (this.zone !== null) this._sampleZone(p);
@@ -374,6 +592,7 @@ export class Emitter {
         // supplied only one of the two.
         p.life = life;
         p.maxLife = maxLife;
+        p._gen = this._emitGen; // 0 normally; deeper inside an onDeath cascade
         return p;
     }
 
@@ -397,6 +616,10 @@ export class Emitter {
      * update(). Use `emit` when you want that checked. `draw()` still clamps
      * normalizedLife to [0,1] regardless of what you write here.
      *
+     * Inside an `onDeath` cascade this stamps the generation like `emit`, so the counter
+     * keeps climbing — but the cap is enforced by `emit`'s throw, not here. For bounded
+     * sub-emission, spawn from `onDeath` via `emit`.
+     *
      * @param {number}   count  How many to spawn
      * @param {Function} initFn Receives (particle, index); writes fields onto the particle
      * @returns {number} How many were actually emitted (< count when the pool saturated)
@@ -409,6 +632,7 @@ export class Emitter {
             if (!p) break; // pool full — stop BEFORE calling initFn (no wasted rng draw)
             if (this.zone !== null) this._sampleZone(p);
             initFn(p, i);
+            p._gen = this._emitGen; // track cascade generation (0 outside an onDeath)
             emitted++;
         }
         return emitted;
@@ -447,20 +671,29 @@ export class Emitter {
      * IMPORTANT: dt must be in SECONDS.
      * If using rAF timestamps: emitter.update((now - last) / 1000)
      *
-     * PHASE ORDER (pinned — LP-10). Per particle, every frame:
+     * PHASE ORDER (pinned — LP-10). Once per frame, then per particle:
+     *   0. follow: move the zone origin to the tracked target (once, top of frame)
      *   1. decrement life (`life -= dt`)
-     *   2. early death: `life <= 0` -> release, skip the rest of this frame
+     *   2. early death: `life <= 0` -> release, then fire `onDeath(p)` (expiry ONLY)
      *   3. integrate: gravity, then frame-independent drag, then position
-     *   4. bounds cull: outside `bounds` -> release
+     *   4. bounds cull: outside `bounds` -> release (NO onDeath — off-screen != death)
      *   5. `onUpdate(particle, dt)` hook
      * Culling deliberately precedes the hook: a particle culled this frame does NOT
      * see its hook, and a hook cannot pull a culled particle back in bounds. This
      * order is a contract (a named test pins it); a refactor must not reorder it.
      *
+     * onDeath fires on life-expiry only (v1.4.0), AFTER the particle is released, so the
+     * hook reads its death x/y and a 1:1 sub-emitter reuses the just-freed slot. A
+     * particle emitted by the hook lands above the descending cursor -> integrated NEXT
+     * frame, never this one (which is what bounds same-frame recursion).
+     *
      * @param {number} dt - Delta time in seconds
      */
     update(dt) {
         if (this._destroyed) return;
+
+        // Phase 0: world-space follow — move the zone origin once, before the loop.
+        if (this._follow !== null) this._trackFollow();
 
         // Dense active array iterated in REVERSE, releasing in place with swap-remove
         // (releaseAt). No `dead[]` buffer, no forEachActive closure, no Set iterator —
@@ -477,8 +710,13 @@ export class Emitter {
             p.life -= dt;
 
             if (p.life <= 0) {
+                // Release FIRST (reset-on-acquire keeps p's dying values), THEN fire the
+                // sub-emitter: the hook reads p's death position and any emit() it makes
+                // can reuse this just-freed slot. onDeath is cold-pathed in _fireDeath so
+                // its try/finally never deopts this loop.
                 pool.releaseAt(i);
                 deaths++;
+                if (this.onDeath) this._fireDeath(p);
                 continue;
             }
 
@@ -518,7 +756,9 @@ export class Emitter {
      * Iterate active particles for rendering.
      * @param {CanvasRenderingContext2D} ctx
      * @param {Function} renderCallback - (ctx, particle, normalizedLife)
-     *   normalizedLife is 1.0 at birth, 0.0 at death — perfect for easing.
+     *   normalizedLife is 1.0 at birth, 0.0 at death — perfect for easing. To ease it
+     *   without Math on the hot path, configure `curves` and hoist a sampler out of your
+     *   loop: `const fade = emitter.curve('alpha')` then `ctx.globalAlpha = fade(t)`.
      */
     draw(ctx, renderCallback) {
         if (this._destroyed) return;
@@ -549,8 +789,12 @@ export class Emitter {
         this._destroyed = true;
         this.pool.destroy();
         this.onUpdate = null;
+        this.onDeath = null;
         this.bounds = null;
         this.zone = null;
+        this._follow = null;
+        this._curveLuts = null;
+        this._curveFns = null;
     }
 }
 

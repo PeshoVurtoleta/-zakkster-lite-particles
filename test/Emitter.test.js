@@ -3,6 +3,10 @@ import assert from 'node:assert/strict';
 
 import { Emitter, normalizeZone, VERSION, ZONE_DRAWS } from '../Emitter.js';
 import { Random } from '@zakkster/lite-random';
+// devDependencies (v1.4.0): the easing curves and interpolation used to build and
+// cross-check the LUTs. The runtime reads a baked table and depends on neither.
+import { easeOutCubic, easeInQuad } from '@zakkster/lite-ease';
+import { lerp } from '@zakkster/lite-lerp';
 
 // toBeCloseTo parity (from the ported suite): pass when |expected - actual| < 10**-digits / 2.
 const closeTo = (actual, expected, digits = 2) =>
@@ -833,6 +837,288 @@ describe('lite-particles', () => {
             e.update(0.1);
             closeTo(p.x, 51, 6);                         // integrated (50 + 10*0.1)
             assert.equal(hook.mock.callCount(), 1);      // survived the cull, hook ran
+        });
+    });
+
+    // ==========================================================
+    //  v1.4.0 - onDeath sub-emitter (fires on expiry only)
+    // ==========================================================
+
+    describe('onDeath sub-emitter', () => {
+        it('fires on life-expiry, with the particle at its death position', () => {
+            let seen = null;
+            const e = new Emitter({ maxParticles: 5, onDeath: (p) => { seen = { x: p.x, y: p.y }; } });
+            e.emit({ x: 12, y: 34, life: 0.5 });
+            e.update(1); // life -> -0.5 <= 0 : expires
+            assert.deepEqual(seen, { x: 12, y: 34 });
+            assert.equal(e.recycledThisFrame, 1);
+        });
+
+        it('does NOT fire on a bounds cull (off-screen is not death)', () => {
+            let fired = 0;
+            const e = new Emitter({
+                maxParticles: 5,
+                bounds: { x: 0, y: 0, width: 100, height: 100 },
+                onDeath: () => { fired++; },
+            });
+            e.emit({ x: 50, y: 50, vx: 100000, vy: 0, life: 100 }); // integrates way out of bounds
+            e.update(1);
+            assert.equal(e.activeCount, 0);   // it was culled
+            assert.equal(fired, 0);           // but onDeath did not fire
+            assert.equal(e.recycledThisFrame, 1); // cull still counts as churn
+        });
+
+        it('does NOT fire on clear() or destroy() (a scene reset is not death)', () => {
+            let fired = 0;
+            const e = new Emitter({ maxParticles: 5, onDeath: () => { fired++; } });
+            e.emit({ life: 5 });
+            e.emit({ life: 5 });
+            e.clear();
+            assert.equal(e.activeCount, 0);
+            e.emit({ life: 5 });
+            e.destroy();
+            assert.equal(fired, 0);
+        });
+
+        it('a particle emitted by onDeath is integrated NEXT frame, not this one', () => {
+            let spark = null;
+            const e = new Emitter({ maxParticles: 5, onDeath: () => { spark = e.emit({ x: 0, y: 0, vx: 100, life: 2 }); } });
+            e.emit({ x: 0, y: 0, life: 0.5 });
+            e.update(1); // kills parent, hook emits spark
+            assert.equal(e.activeCount, 1);   // the spark is alive
+            assert.ok(spark);
+            assert.equal(spark.life, 2);      // NOT decremented this frame (born after the cursor passed)
+            assert.equal(spark.x, 0);         // NOT integrated this frame (would be 100*1)
+            e.update(1);                      // now it moves
+            closeTo(spark.x, 100, 6);
+        });
+
+        it('a full-pool 1:1 sub-emitter reuses the just-freed slot', () => {
+            let sparks = 0;
+            const e = new Emitter({ maxParticles: 1, onDeath: () => { sparks++; e.emit({ x: 0, y: 0, life: 1 }); } });
+            e.emit({ x: 0, y: 0, life: 0.5 }); // pool now full (size 1)
+            e.update(1);                       // parent dies, frees the slot, hook re-emits into it
+            assert.equal(sparks, 1);
+            assert.equal(e.activeCount, 1);    // spark took the freed slot
+        });
+
+        it('keeps iteration correct under randomized churn with a 1:N sub-emitter (fuzz vs invariants)', () => {
+            const rng = new Random(1234);
+            const e = new Emitter({
+                maxParticles: 64,
+                onDeath: (p) => {
+                    // spawn 0..2 shorter-lived children at the death site, but bound the
+                    // lineage well under the cap so the fuzz stays about ITERATION, not the cap
+                    if (p._gen >= 4) return;
+                    const n = (rng.next() * 3) | 0;
+                    for (let k = 0; k < n; k++) e.emit({ x: p.x, y: p.y, vx: rng.next() * 10, life: 0.2 + rng.next() * 0.6 });
+                },
+            });
+            for (let step = 0; step < 4000; step++) {
+                if (rng.next() < 0.6) e.emit({ x: rng.next() * 50, y: rng.next() * 50, life: 0.1 + rng.next() });
+                e.update(0.1 + rng.next() * 0.2);
+                // pool invariants must hold every single step
+                assert.equal(e.pool.used + e.pool.free, e.pool.size);
+                assert.equal(e.activeCount, e.pool.active);
+                assert.ok(e.activeCount >= 0 && e.activeCount <= e.pool.size);
+            }
+            e.clear();
+            assert.equal(e.activeCount, 0);
+            assert.equal(e.pool.free, e.pool.size);
+        });
+    });
+
+    // ==========================================================
+    //  v1.4.0 - onDeath cascade cap (throws past maxCascadeDepth)
+    // ==========================================================
+
+    describe('onDeath cascade cap', () => {
+        // Drive a self-emitting cascade (each spark dies next frame and spawns one deeper)
+        // until it either settles or throws. Returns { threw, err, gens } (generations that
+        // actually lived and died).
+        const runCascade = (maxCascadeDepth) => {
+            const gens = new Set();
+            const opts = { maxParticles: 256, onDeath: (p) => { gens.add(p._gen); e.emit({ x: 0, y: 0, life: 0.001 }); } };
+            if (maxCascadeDepth !== undefined) opts.maxCascadeDepth = maxCascadeDepth;
+            const e = new Emitter(opts);
+            e.emit({ x: 0, y: 0, life: 0.001 });
+            let threw = null;
+            try { for (let f = 0; f < 50; f++) e.update(1); }
+            catch (err) { threw = err; }
+            return { threw, gens };
+        };
+
+        it('throws a RangeError naming maxCascadeDepth once the cascade is too deep', () => {
+            const { threw } = runCascade(3);
+            assert.ok(threw instanceof RangeError);
+            assert.match(threw.message, /maxCascadeDepth \(3\)/);
+        });
+
+        it('never lets generation cap+1 be born', () => {
+            const cap = 4;
+            const { gens } = runCascade(cap);
+            assert.equal(Math.max(...gens), cap); // deepest generation that ever lived == the cap
+            assert.ok(!gens.has(cap + 1));         // cap+1 was refused before it could exist
+        });
+
+        it('defaults the cap to 8', () => {
+            const { threw, gens } = runCascade(undefined);
+            assert.ok(threw instanceof RangeError);
+            assert.match(threw.message, /maxCascadeDepth \(8\)/);
+            assert.equal(Math.max(...gens), 8);
+        });
+
+        it('a bounded cascade (fewer generations than the cap) completes without throwing', () => {
+            let depth = 0;
+            const e = new Emitter({
+                maxParticles: 64,
+                maxCascadeDepth: 8,
+                onDeath: (p) => { if (p._gen < 3) e.emit({ x: 0, y: 0, life: 0.001 }); }, // stops at gen 3
+            });
+            e.emit({ x: 0, y: 0, life: 0.001 });
+            assert.doesNotThrow(() => { for (let f = 0; f < 20; f++) e.update(1); });
+            assert.equal(e.activeCount, 0);
+        });
+    });
+
+    // ==========================================================
+    //  v1.4.0 - curves (baked Float32Array LUTs)
+    // ==========================================================
+
+    describe('curves', () => {
+        it('curve(name) matches the easing function within tolerance across 256 samples', () => {
+            const e = new Emitter({ maxParticles: 1, curves: { grow: easeOutCubic } });
+            const grow = e.curve('grow');
+            for (let i = 0; i <= 256; i++) {
+                const t = i / 256;
+                assert.ok(Math.abs(grow(t) - easeOutCubic(t)) < 1e-3, `t=${t}`);
+            }
+        });
+
+        it('is exact at the endpoints and clamps outside [0,1]', () => {
+            const e = new Emitter({ maxParticles: 1, curves: { q: easeInQuad } });
+            const q = e.curve('q');
+            closeTo(q(0), easeInQuad(0), 9);
+            closeTo(q(1), easeInQuad(1), 9);
+            assert.equal(q(-5), q(0)); // clamped low
+            assert.equal(q(5), q(1));  // clamped high
+        });
+
+        it('interpolates linearly between samples (matches a hand lerp of the table)', () => {
+            const e = new Emitter({ maxParticles: 1, curveSegments: 8, curves: { c: easeOutCubic } });
+            const table = e.curveTable('c');
+            const c = e.curve('c');
+            const t = 0.3;
+            const x = t * (table.length - 1);
+            const i = x | 0;
+            closeTo(c(t), lerp(table[i], table[i + 1], x - i), 6);
+        });
+
+        it('curveTable(name) is a Float32Array of curveSegments length', () => {
+            const e = new Emitter({ maxParticles: 1, curveSegments: 128, curves: { c: easeOutCubic } });
+            const t = e.curveTable('c');
+            assert.ok(t instanceof Float32Array);
+            assert.equal(t.length, 128);
+        });
+
+        it('curve() returns a stable closure (same reference every call)', () => {
+            const e = new Emitter({ maxParticles: 1, curves: { c: easeOutCubic } });
+            assert.equal(e.curve('c'), e.curve('c'));
+        });
+
+        it('an unknown curve name throws (both curve and curveTable)', () => {
+            const e = new Emitter({ maxParticles: 1, curves: { c: easeOutCubic } });
+            assert.throws(() => e.curve('nope'), TypeError);
+            assert.throws(() => e.curveTable('nope'), TypeError);
+        });
+
+        it('an emitter with no curves throws on curve()', () => {
+            const e = new Emitter({ maxParticles: 1 });
+            assert.throws(() => e.curve('c'), TypeError);
+        });
+
+        it('rejects a malformed curves config', () => {
+            assert.throws(() => new Emitter({ curves: { bad: 42 } }), TypeError);
+            assert.throws(() => new Emitter({ curves: 'nope' }), TypeError);
+            assert.throws(() => new Emitter({ curves: { c: easeOutCubic }, curveSegments: 1 }), RangeError);
+        });
+    });
+
+    // ==========================================================
+    //  v1.4.0 - follow(target) (world-space: moves the zone origin)
+    // ==========================================================
+
+    describe('follow(target)', () => {
+        it('moves a point / ring / rect zone origin to the target each update', () => {
+            for (const zone of [
+                { type: 'point', x: 0, y: 0 },
+                { type: 'ring', x: 0, y: 0, radius: 5 },
+                { type: 'rect', x: 0, y: 0, width: 4, height: 4 },
+            ]) {
+                const e = new Emitter({ maxParticles: 4, zone });
+                const target = { x: 7, y: 9 };
+                e.follow(target);
+                e.update(0.016);
+                assert.equal(e.zone.x, 7);
+                assert.equal(e.zone.y, 9);
+            }
+        });
+
+        it('translates a line zone by the target delta, preserving its shape', () => {
+            const e = new Emitter({ maxParticles: 4, zone: { type: 'line', x1: 0, y1: 0, x2: 10, y2: 0 } });
+            const target = { x: 0, y: 0 };
+            e.follow(target);
+            target.x = 3; target.y = 4;
+            e.update(0.016);
+            assert.deepEqual(
+                { x1: e.zone.x1, y1: e.zone.y1, x2: e.zone.x2, y2: e.zone.y2 },
+                { x1: 3, y1: 4, x2: 13, y2: 4 }, // both endpoints shifted by (3,4); length still 10
+            );
+        });
+
+        it('is world-space: particles already emitted do not move', () => {
+            const e = new Emitter({ maxParticles: 4, zone: { type: 'point', x: 0, y: 0 } });
+            const target = { x: 0, y: 0 };
+            e.follow(target);
+            const born = e.emit({ life: 100 }); // spawns at (0,0)
+            target.x = 500; target.y = 500;
+            e.update(0.016);                    // zone jumps to (500,500)...
+            assert.equal(e.zone.x, 500);
+            assert.equal(born.x, 0);            // ...but the existing particle stays put
+            assert.equal(born.y, 0);
+            const next = e.emit({ life: 100 }); // a NEW emit uses the moved origin
+            assert.equal(next.x, 500);
+            assert.equal(next.y, 500);
+        });
+
+        it('follow(null) stops tracking', () => {
+            const e = new Emitter({ maxParticles: 4, zone: { type: 'point', x: 0, y: 0 } });
+            const target = { x: 1, y: 1 };
+            e.follow(target);
+            e.update(0.016);
+            assert.equal(e.zone.x, 1);
+            e.follow(null);
+            target.x = 99; target.y = 99;
+            e.update(0.016);
+            assert.equal(e.zone.x, 1); // unchanged: no longer following
+        });
+
+        it('a null / non-finite target is a per-frame no-op (no NaN in the zone)', () => {
+            const e = new Emitter({ maxParticles: 4, zone: { type: 'point', x: 2, y: 3 } });
+            const target = { x: 2, y: 3 };
+            e.follow(target);
+            target.x = NaN;
+            e.update(0.016);
+            assert.ok(Number.isFinite(e.zone.x) && Number.isFinite(e.zone.y));
+            assert.equal(e.zone.x, 2); // stayed at the last good origin
+            target.x = undefined;
+            e.update(0.016);
+            assert.equal(e.zone.x, 2);
+        });
+
+        it('throws if asked to follow with no zone to move', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            assert.throws(() => e.follow({ x: 1, y: 1 }), TypeError);
         });
     });
 });

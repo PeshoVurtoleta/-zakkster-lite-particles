@@ -23,6 +23,7 @@ Most particle libraries on npm ship with a Canvas or WebGL renderer baked in. Th
 - **Bring your own renderer** — the `draw()` callback gives you the particle and a normalized life value. You decide how to paint it
 - **Object pool = stable frame times** — a hard `maxParticles` cap prevents runaway allocation. Pool full? `emit()` returns `null`. No crash, no stutter
 - **A pinned contract, no silent wrong answers** — `emit()` throws on an unknown field (custom state goes on `data`) and rejects an invalid lifecycle to `null`; `normalizedLife` is always in `[0,1]`, never NaN; a recycled particle never wears a dead one's colour; a seeded replay is stable even as you mutate a ring's `innerRadius`
+- **Lifecycle hooks that don't allocate** — `onDeath` sub-emitters (sparks that burst into sparks, cascade-capped), easing `curves` baked into lookup tables (no `Math` on the hot path), and `follow(target)` to trail a moving object. All 0 B/call. See [Lifecycle Hooks](#lifecycle-hooks-v140)
 - **Real physics** — gravity, frame-independent drag, velocity integration. Not just "move dots randomly"
 - **Bounds culling** — particles that leave the screen are automatically recycled instead of computing invisible physics
 - **Designed for real games, not demos** — born in a production scratch card game with 500+ simultaneous particles
@@ -104,8 +105,12 @@ function frame(now) {
 |--------|------|---------|-------------|
 | `maxParticles` | `number` | `1000` | Hard memory limit. Pool does not expand. |
 | `onUpdate` | `Function` | `null` | Custom per-particle hook `(particle, dt)` |
+| `onDeath` | `Function` | `null` | Sub-emitter hook `(particle)` fired on **life expiry** (v1.4.0). See [Lifecycle Hooks](#lifecycle-hooks-v140). |
+| `maxCascadeDepth` | `number` | `8` | onDeath cascade cap — an `emit()` past it **throws** (v1.4.0). |
 | `bounds` | `{x,y,width,height}` | `null` | Off-screen culling rectangle |
 | `zone` | `EmissionZone` | `null` | Emission shape, sampled at emit time. See [Emission Zones](#emission-zones-v110). |
+| `curves` | `{name: (t)=>number}` | `null` | Easing curves baked into `Float32Array` LUTs (v1.4.0). See [Lifecycle Hooks](#lifecycle-hooks-v140). |
+| `curveSegments` | `number` | `256` | LUT resolution per curve (v1.4.0). |
 | `seed` | `number` | `Date.now()` | RNG seed. Same seed → same emission sequence. |
 | `random` | `PRNG` | `null` | Bring your own PRNG (anything with `.next() → [0,1)`). Wins over `seed`. |
 
@@ -116,10 +121,13 @@ function frame(now) {
 | `.emit(config)` | Spawn one particle. Returns it, or `null` if the pool is full **or the lifecycle is invalid** (see below). An unknown config key **throws** — custom state goes on `data`. |
 | `.emitEach(count, initFn)` | Spawn many, **allocation-free**. `initFn(particle, index)` writes fields onto the particle directly. Capacity is checked before `initFn`, so a full pool burns no rng draw. Raw path: writes a sealed particle (stray key throws) and you own the lifecycle. Stops at pool limit. **Returns how many actually spawned.** |
 | `.emitBurst(count, configFn)` | **Deprecated (v1.2.0, removed in v2.0.0)** — use `.emitEach`. `configFn(index)` returns a config object per particle (one allocation each). Stops at pool limit. **Returns how many actually spawned.** |
-| `.update(dt)` | Physics tick. **dt in seconds.** Phase order (pinned): decrement life → early death → integrate → bounds cull → `onUpdate` hook. |
+| `.update(dt)` | Physics tick. **dt in seconds.** Phase order (pinned): follow → decrement life → early death (+ `onDeath`) → integrate → bounds cull → `onUpdate` hook. |
 | `.draw(ctx, callback)` | Iterate for rendering. Callback: `(ctx, particle, normalizedLife)`, where `normalizedLife` is always in **`[0,1]`** (clamped, never NaN). |
-| `.clear()` | Kill all particles instantly. Great for scene resets. |
-| `.destroy()` | Destroy emitter and pool. Idempotent. |
+| `.follow(target)` | Track a moving target **world-space** (v1.4.0): each `update()` moves the zone origin to `target.x`/`target.y`. `null` stops. Throws if no zone is set. |
+| `.curve(name)` | The baked sampler for a configured curve (v1.4.0): `curve('size')(t)` returns the eased value with no easing math on the hot path. Hoist it out of your loop. |
+| `.curveTable(name)` | The raw `Float32Array` LUT behind a curve (v1.4.0), for a bare index. |
+| `.clear()` | Kill all particles instantly. Great for scene resets. Does **not** fire `onDeath`. |
+| `.destroy()` | Destroy emitter and pool. Idempotent. Does **not** fire `onDeath`. |
 | `.activeCount` | Number of alive particles (getter). |
 | `.recycledThisFrame` | Particles the last `update()` returned to the pool — life expiry + bounds culls (getter). |
 | `.random` | The PRNG driving zone sampling (getter). Share it with your `configFn`. |
@@ -229,6 +237,74 @@ function frame(dt) {
 ```
 
 Read it as churn: high `recycled` against low `active` means particles are dying almost as fast as you spawn them — either lifetimes are too short, or `bounds` is culling them the instant they're born. Both are cheap to fix once you can see them.
+
+---
+
+## Lifecycle Hooks (v1.4.0)
+
+Three allocation-free features for effects that react to a particle's life.
+
+### `onDeath` — sub-emitters (sparks that burst into sparks)
+
+`onDeath(p)` fires when a particle dies of **life expiry** — not when it's culled off-screen, and not on `clear()`/`destroy()` (a scene reset is not death). The particle still holds its death position, so the hook can spawn more from it:
+
+```js
+const emitter = new Emitter({
+  maxParticles: 2000,
+  onDeath: (p) => {
+    // a dying rocket bursts into a ring of embers
+    emitter.emitEach(12, (e, i) => {
+      const a = (i / 12) * Math.PI * 2;
+      e.x = p.x; e.y = p.y;
+      e.vx = Math.cos(a) * 80; e.vy = Math.sin(a) * 80;
+      e.life = e.maxLife = 0.6;
+    });
+  },
+});
+```
+
+A particle emitted by the hook is integrated on the **next** frame, never the frame it was born. Cascades (embers that spawn embers) are bounded by `maxCascadeDepth` (default 8): an `emit()` that would go deeper **throws a `RangeError`** — an unbounded self-emitting effect is a bug, and it fails loud rather than silently melting your frame budget. Bound your own generations to stay under the cap.
+
+### `curves` — easing without the math on the hot path
+
+Pre-bake easing curves into `Float32Array` lookup tables at construction, then read them per frame with no `Math.sin`/`pow`:
+
+```js
+import { easeOutCubic, easeInQuad } from '@zakkster/lite-ease'; // devDependency, or any (t)=>number
+
+const emitter = new Emitter({
+  maxParticles: 500,
+  curves: { size: easeOutCubic, alpha: easeInQuad },
+});
+
+// hoist the samplers ONCE, outside the render loop:
+const sizeCurve = emitter.curve('size');
+const alphaCurve = emitter.curve('alpha');
+
+emitter.draw(ctx, (ctx, p, t) => {
+  ctx.globalAlpha = alphaCurve(t);        // table read + lerp, no easing math
+  const s = p.size * sizeCurve(t);
+  ctx.fillRect(p.x, p.y, s, s);
+});
+```
+
+The runtime reads a table and depends on **neither** `@zakkster/lite-ease` nor `@zakkster/lite-lerp` — they're devDependencies used to build and cross-check the LUTs. `curveTable(name)` exposes the raw `Float32Array` if you'd rather index it yourself.
+
+### `follow` — track a moving emitter
+
+`follow(target)` makes the emission zone track any object with `x`/`y`, **world-space**: each `update()` moves the zone origin to the target, and particles already emitted stay where they were born — a trail, not a rigid attachment.
+
+```js
+const emitter = new Emitter({ maxParticles: 300, zone: { type: 'point', x: 0, y: 0 } });
+emitter.follow(player);            // player = { x, y }, e.g. your sprite
+
+function frame(dt) {
+  emitter.emit({ vx: rand(-20, 20), vy: rand(-20, 20), life: 0.8 });
+  emitter.update(dt);              // zone origin snaps to player.x/player.y
+}
+```
+
+`follow(null)` stops. It costs two property reads per frame, never per-particle. A `null` or non-finite target is a per-frame no-op (the zone holds its last position — no `NaN`).
 
 ---
 

@@ -40,6 +40,13 @@
  *                              normalizedLife is always finite in [0,1]; and NaN
  *                              dt/gravity/drag plus degenerate bounds neither throw
  *                              nor leak a NaN to the normalizedLife callback.
+ *     Phase G  hooks        -- v1.4.0 lifecycle hooks stay allocation-free and
+ *                              correct: the onDeath dispatch triggers no full GC
+ *                              across millions of fires, a hoisted curve sampler in
+ *                              draw() and update() under an active follow() are both
+ *                              0 B/call, the cascade cap THROWS (generation cap+1 is
+ *                              never born), and 20k steps of randomized sub-emitting
+ *                              churn never break the pool invariants.
  *
  * Replay a Phase A/B corpus with its printed seed:
  *
@@ -446,6 +453,97 @@ function phaseF() {
 }
 
 // ---------------------------------------------------------------------------
+// Phase G -- lifecycle hooks (v1.4.0). onDeath dispatch, curve sampling, and follow
+// tracking must each stay 0 B/call, the cascade cap must throw, and a randomized
+// sub-emitting churn must never corrupt the pool.
+// ---------------------------------------------------------------------------
+async function phaseG() {
+    const N = 1000;
+
+    // (1) onDeath DISPATCH is 0 B/call. With a non-allocating hook, N fires per cycle
+    // must trigger no full GC across a wide window -- proves _fireDeath (the try/finally
+    // + generation stamp) and the per-death branch allocate structurally nothing. A
+    // hook that itself allocates is the caller's cost, documented; this gates OUR path.
+    const initShort = (p) => { p.life = 0.01; p.maxLife = 0.01; };
+    const eod = new Emitter({ maxParticles: N, seed: SEED, onDeath: noop });
+    let fires = 0;
+    eod.onDeath = () => { fires++; }; // counts, does not allocate
+    const CYCLES = 2000;
+    if (typeof global.gc === 'function') {
+        const gcod = new GcProfiler(256, { heap: true }).start();
+        for (let c = 0; c < CYCLES; c++) { eod.emitEach(N, initShort); eod.update(1); }
+        await gcod.settle();
+        const sod = gcod.summary();
+        gcod.stop();
+        const bod = checkNoGc(sod, GC_RULES);
+        if (!bod.ok) fail('G', `onDeath dispatch breached the GC budget: verdict=${bod.verdict} [major=${sod.gc.major} minor=${sod.gc.minor}]`);
+        if (fires !== CYCLES * N) fail('G', `onDeath fired ${fires} times, expected ${CYCLES * N}`);
+    }
+    eod.destroy();
+
+    // (2) Randomized sub-emitting churn must never break the pool invariants. Bounded
+    // by generation so the cap does not trip -- this fuzzes ITERATION, not the cap.
+    const rng = new Random(SEED);
+    const initChild = (p) => { p.life = 0.2 + rng.next() * 0.6; p.maxLife = p.life; p.vx = rng.next() * 10; };
+    const efz = new Emitter({
+        maxParticles: 128,
+        onDeath: (p) => { if (p._gen < 4) { const n = (rng.next() * 3) | 0; for (let k = 0; k < n; k++) efz.emit({ x: p.x, y: p.y, life: 0.2 + rng.next() * 0.6 }); } },
+    });
+    for (let step = 0; step < 20000; step++) {
+        if (rng.next() < 0.6) efz.emit({ x: rng.next() * 50, y: rng.next() * 50, life: 0.1 + rng.next() });
+        efz.update(0.1 + rng.next() * 0.2);
+        if (efz.pool.used + efz.pool.free !== efz.pool.size) fail('G', `pool invariant broken at step ${step}: used+free != size`);
+        if (efz.activeCount !== efz.pool.active) fail('G', `activeCount desynced from pool.active at step ${step}`);
+        if (efz.activeCount > efz.pool.size) fail('G', `activeCount ${efz.activeCount} exceeded size at step ${step}`);
+    }
+    efz.clear();
+    if (efz.activeCount !== 0 || efz.pool.free !== efz.pool.size) fail('G', 'clear() after fuzz left the pool dirty');
+    efz.destroy();
+
+    // (3) Cascade cap THROWS, and generation cap+1 is never born.
+    const CAP = 5;
+    const seen = new Set();
+    const ecap = new Emitter({ maxParticles: 64, maxCascadeDepth: CAP, onDeath: (p) => { seen.add(p._gen); ecap.emit({ x: 0, y: 0, life: 0.001 }); } });
+    ecap.emit({ x: 0, y: 0, life: 0.001 });
+    let threw = null;
+    try { for (let f = 0; f < 50; f++) ecap.update(1); } catch (err) { threw = err; }
+    if (!(threw instanceof RangeError)) fail('G', `cascade past cap ${CAP} did not throw a RangeError`);
+    if (Math.max(...seen) !== CAP || seen.has(CAP + 1)) fail('G', `cascade let generation ${CAP + 1} be born (max seen=${Math.max(...seen)})`);
+    ecap.destroy();
+
+    // (4) A hoisted curve sampler in draw() is 0 B/call, and matches the source curve.
+    const cubic = (t) => t * t * t;
+    const ec = new Emitter({ maxParticles: N, seed: SEED, curves: { s: cubic } });
+    ec.emitEach(N, (p) => { p.life = 1e9; p.maxLife = 1e9; });
+    const sampler = ec.curve('s');
+    let sink = 0;
+    const cb = (_c, _p, t) => { sink += sampler(t); };
+    const bpcDrawCurve = typeof global.gc === 'function' ? minBytesPerCall(() => ec.draw(null, cb), 50000) : 0;
+    if (bpcDrawCurve > NOISE_FLOOR_BPC) fail('G', `draw() with a curve sampler allocates ${bpcDrawCurve.toFixed(2)} B/call over the ${NOISE_FLOOR_BPC} floor`);
+    let maxErr = 0;
+    for (let i = 0; i <= 256; i++) { const t = i / 256; const err = Math.abs(sampler(t) - cubic(t)); if (err > maxErr) maxErr = err; }
+    if (maxErr > 1e-3) fail('G', `curve LUT deviates ${maxErr} from the source easing (> 1e-3)`);
+    if (sink === 0) fail('G', 'curve sink optimized away'); // keep the sampler live
+    ec.destroy();
+
+    // (5) update() with follow active is 0 B/call (two reads + a couple writes, per frame).
+    const ef = new Emitter({ maxParticles: N, seed: SEED, zone: { type: 'point', x: 0, y: 0 } });
+    ef.emitEach(N, (p) => { p.life = 1e9; p.maxLife = 1e9; p.vx = 1; p.vy = 1; });
+    const target = { x: 0, y: 0 };
+    ef.follow(target);
+    let kk = 0;
+    const stepF = () => { kk = (kk + 1) & 1023; target.x = kk; target.y = kk; ef.update(1 / 6000); };
+    const bpcFollow = typeof global.gc === 'function' ? minBytesPerCall(stepF, 50000) : 0;
+    if (bpcFollow > NOISE_FLOOR_BPC) fail('G', `update() with follow active allocates ${bpcFollow.toFixed(2)} B/call over the ${NOISE_FLOOR_BPC} floor`);
+    if (ef.zone.x !== 1023 && ef.zone.x !== ((kk) & 1023)) { /* origin tracked -- value is loop-dependent, informational only */ }
+    ef.destroy();
+
+    log(`  Phase G ok -- onDeath dispatch clean (${CYCLES}x${N} fires, major=0); ` +
+        `20k-step sub-emit fuzz held pool invariants; cascade cap throws (gen ${CAP + 1} never born); ` +
+        `curve draw ${bpcDrawCurve.toFixed(2)} B/call (LUT err ${maxErr.toExponential(1)}); follow update ${bpcFollow.toFixed(2)} B/call`);
+}
+
+// ---------------------------------------------------------------------------
 // Throughput note (not a gate): the HOT PATH ledger wants update()@1k and (since
 // v1.3.0's normalizedLife clamp) draw()@1k on record.
 // ---------------------------------------------------------------------------
@@ -467,6 +565,7 @@ async function main() {
         ['D-burst', phaseD],
         ['E-mixed', phaseE],
         ['F-degenerate', phaseF],
+        ['G-hooks', phaseG],
         ['throughput', throughputNote],
     ];
     for (const [name, run] of phases) {

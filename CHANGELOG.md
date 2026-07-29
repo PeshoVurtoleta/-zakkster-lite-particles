@@ -4,6 +4,70 @@ All notable changes to `@zakkster/lite-particles` are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.4.0] - 2026-07-29
+
+Lifecycle hooks. Three features the loop was cleaned (P1) and pinned (P2) to make
+room for, all allocation-free: a dying particle can spawn more (`onDeath`), an easing
+curve can be read from a baked table instead of recomputed every frame (`curves`), and
+the emission origin can track a moving object (`follow`). Every P1/P2 allocation gate
+stays green.
+
+### Added
+
+- **`onDeath(particle)` sub-emitter hook.** Fires when a particle is released by
+  **life expiry** -- not on a bounds cull (no sparks spawned off-screen), not on
+  `clear()`/`destroy()` (a scene reset is not death). The particle still holds its
+  death position, so the hook can `emit()` embers from it. A particle emitted by the
+  hook is integrated on the **next** frame, never the frame it was born. Constructor
+  option and settable `emitter.onDeath`, mirroring `onUpdate`. See `decisions/0007`.
+- **`maxCascadeDepth` (default 8).** Sub-emitters can cascade (sparks emitting sparks).
+  Generations are tracked per particle; an `emit()` that would exceed the cap **throws
+  a `RangeError`** naming the depth -- an unbounded self-emitting effect is a bug,
+  surfaced loud like `emit()`'s unknown-key throw, not a silent frame-time cliff.
+- **`curves` + `curve(name)` / `curveTable(name)`.** `new Emitter({ curves: { size:
+  fn, ... } })` bakes each `(t)=>number` easing into a `Float32Array` LUT at
+  construction (resolution `curveSegments`, default 256). `curve('size')` returns a
+  pre-built, interpolating sampler closure -- hoist it out of your render loop and it
+  reads the table with no easing `Math` on the hot path; `curveTable('size')` exposes
+  the raw array. `@zakkster/lite-ease` supplies the curves in userland; the runtime
+  reads a table and gains no dependency. See `decisions/0008`.
+- **`follow(target)`.** The emission zone tracks `target.x`/`target.y` world-space --
+  each `update()` moves the zone ORIGIN (two reads, O(1), never per-particle), leaving
+  already-emitted particles where they were born (a comet trail). `follow(null)` stops;
+  following with no zone throws; a null/non-finite target is a per-frame no-op that
+  writes no `NaN`. See `decisions/0009`.
+- **Torture Phase G** -- the onDeath dispatch triggers no full GC across millions of
+  fires, a hoisted curve sampler in `draw()` and `update()` under an active `follow()`
+  are both 0 B/call, the cascade cap throws (generation cap+1 is never born), and 20k
+  steps of randomized sub-emitting churn hold the pool invariants.
+- **`decisions/0007-ondeath-subemitter.md`**, **`0008-curves-lut.md`**,
+  **`0009-follow.md`** -- the three P3 records.
+
+### Changed
+
+- **The particle pool is now reset-on-acquire.** `releaseAt()` only swap-removes;
+  `acquire()` resets on the way out. This lets `update()` release a dying particle
+  **before** firing `onDeath` (so the hook reads its death position, a 1:1 sub-emitter
+  reuses the just-freed slot, and a cap-exceeded throw leaves the pool consistent).
+  Net allocation is unchanged -- the reset moved from release-time to acquire-time,
+  both writes to existing sealed keys -- and torture Phase B stays 0 B/call. A
+  consequence: `clear()` is now a pure pointer move (freed particles reset lazily on
+  reacquire). See `decisions/0007`.
+
+### Notes
+
+- **`emitEach` stays the raw path.** It stamps the cascade generation like `emit` (so
+  a cascade driven through it still climbs into the cap), but the cap's throw lives in
+  `emit`; spawn from `onDeath` via `emit` for the checked path.
+- Particles gain a private, **non-enumerable** `_gen` field (the cascade generation),
+  so the public particle shape is exactly the v1.3.0 schema -- `Object.keys(p)` and
+  `{...p}` are unchanged.
+- `@zakkster/lite-ease` and `@zakkster/lite-lerp` are added as **devDependencies**
+  (they build and cross-check the curve LUTs in the tests). The runtime `dependencies`
+  remain only `@zakkster/lite-random`.
+- Every v1.2.0 / v1.3.0 allocation gate (torture Phase B / E / F) stays green with all
+  three features in place.
+
 ## [1.3.0] - 2026-07-29
 
 Pin the contract. Four behaviours that neither threw nor were pinned -- a recycled

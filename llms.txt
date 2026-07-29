@@ -15,10 +15,14 @@ npm install @zakkster/lite-particles
 - `VERSION` — string
 
 ## Constructor
-`new Emitter({ maxParticles?, onUpdate?, bounds? })`
+`new Emitter({ maxParticles?, onUpdate?, onDeath?, maxCascadeDepth?, bounds?, zone?, curves?, curveSegments?, seed?, random? })`
 - `maxParticles: number` (default 1000) — Hard memory limit (pool does not expand)
 - `onUpdate: (particle, dt) => void` — Custom per-particle physics hook
+- `onDeath: (particle) => void` — Sub-emitter hook fired on LIFE EXPIRY (v1.4.0). Not on a bounds cull, not on clear()/destroy(). The particle still holds its death position; the hook may emit() more particles from it (integrated NEXT frame).
+- `maxCascadeDepth: number` (default 8) — onDeath cascade cap; an emit() that would exceed it THROWS a RangeError (v1.4.0)
 - `bounds: { x, y, width, height }` — Off-screen culling rectangle
+- `curves: { name: (t)=>number }` — Easing functions baked into Float32Array LUTs, read via curve()/curveTable() (v1.4.0)
+- `curveSegments: number` (default 256) — LUT resolution per curve
 
 ## API
 - `.emit(config): particle | null` — Spawn one particle. Config keys must be particle fields `{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }`; an UNKNOWN key THROWS a TypeError (custom colours/sprites/metadata go on `data`). `life`/`maxLife` are coupled (give either, the other mirrors it); an effective `life <= 0`, `maxLife <= 0`, or non-finite value returns null (no dead-on-arrival particle). Returns null if the pool is full.
@@ -26,9 +30,12 @@ npm install @zakkster/lite-particles
 - `.emitBurst(count, configFn)` — DEPRECATED since v1.2.0 (removed in v2.0.0); use `.emitEach`. `configFn(index)` returns a config object per particle (one allocation each).
 - `.update(dt)` — Core physics tick. **dt must be in SECONDS** (divide rAF ms by 1000). Applies gravity, drag, velocity, bounds culling, then calls onUpdate hook.
 - `.draw(ctx, renderCallback)` — Iterate alive particles for rendering. `renderCallback(ctx, particle, normalizedLife)` where normalizedLife is 1.0 at birth → 0.0 at death, ALWAYS clamped to [0,1] and never NaN (even if a hook wrote a bad life/maxLife).
-- `.clear()` — Kill all particles instantly (scene reset).
+- `.follow(target | null)` — Track a moving target WORLD-SPACE (v1.4.0): each update() moves the ZONE ORIGIN to `target.x`/`target.y` (two reads, O(1)); already-emitted particles stay where they were born. `null` stops. Throws if no zone is set. A null/non-finite target is a per-frame no-op (no NaN written).
+- `.curve(name)` — The baked sampler for a configured curve: `emitter.curve('size')(normalizedLife)` returns the eased value with no easing math on the hot path. Hoist it out of your render loop (stable closure). Throws on an unknown name.
+- `.curveTable(name)` — The raw Float32Array LUT behind a curve, for a bare index. Throws on an unknown name.
+- `.clear()` — Kill all particles instantly (scene reset). Does NOT fire onDeath.
 - `.activeCount` — Number of alive particles (getter).
-- `.destroy()` — Destroy pool. Idempotent.
+- `.destroy()` — Destroy pool. Idempotent. Does NOT fire onDeath.
 
 ## Particle Properties
 `{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }`
@@ -162,3 +169,41 @@ is unchanged. Dimension mutation goes through setZone(); position (x/y) stays li
 ### Phase order (LP-10)
 update() order is pinned (named test): decrement life -> early death -> integrate (gravity, drag,
 move) -> bounds cull -> onUpdate hook. Culling precedes the hook: a culled particle does not see it.
+
+## v1.4.0 — lifecycle hooks
+
+Three allocation-free features. The pool is now reset-on-acquire (releaseAt swap-removes; acquire
+resets), so update() releases a dying particle BEFORE firing onDeath. update() phase 0 is now
+`follow` (move the zone origin), then the pinned per-particle order above; onDeath fires after the
+release on life-expiry.
+
+### onDeath sub-emitter
+new Emitter({ onDeath }) fires onDeath(p) when a particle is released by LIFE EXPIRY only — not on a
+bounds cull (no off-screen sparks), not on clear()/destroy() (a scene reset is not death). The
+particle holds its death x/y, so the hook can emit() embers from it. A particle emitted by the hook
+lands above update()'s descending cursor, so it is integrated on the NEXT frame, never the frame it
+was born. A full pool's just-freed slot is reusable, so a 1:1 sub-emitter never drops its spark.
+
+### Cascade cap (throws)
+Sub-emitters can cascade (sparks emitting sparks). Generations are tracked per particle (private,
+non-enumerable `_gen`). new Emitter({ maxCascadeDepth }) defaults to 8; an emit() that would create a
+generation past the cap THROWS a RangeError naming the depth — an unbounded self-emitting effect is a
+bug, surfaced loud like emit()'s unknown-key throw. emitEach stamps the generation too but the throw
+lives in emit(); spawn from onDeath via emit() for the checked path.
+
+### curves (baked LUTs)
+new Emitter({ curves: { size: fn, alpha: fn }, curveSegments }) bakes each (t)=>number easing into a
+Float32Array LUT at construction (curveSegments default 256). emitter.curve('size') returns a
+pre-built interpolating sampler closure — HOIST it out of your render loop: `const s =
+emitter.curve('size')` then `s(normalizedLife)` reads the table with no easing Math on the hot path.
+emitter.curveTable('size') gives the raw Float32Array for a bare index. Unknown name throws.
+@zakkster/lite-ease supplies the curves in userland; the runtime reads a table and depends on neither
+lite-ease nor lite-lerp (both are devDependencies of this package). draw() with a hoisted sampler is
+0 B/call; the LUT matches the source easing within < 1e-3 across 256 samples.
+
+### follow(target)
+emitter.follow(target) tracks a moving object WORLD-SPACE: each update() moves the zone ORIGIN to
+target.x/target.y (two reads, O(1), never per-particle), leaving already-emitted particles where they
+were born (a comet trail). Point/ring/rect move the origin; a line zone translates by delta.
+follow(null) stops. Following with no zone throws. A null/non-finite target is a per-frame no-op that
+writes no NaN (fail closed). update() under an active follow is 0 B/call.

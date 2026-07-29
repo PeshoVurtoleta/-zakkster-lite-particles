@@ -86,10 +86,30 @@ export interface EmitterOptions {
     maxParticles?: number;
     /** Custom per-particle physics hook. */
     onUpdate?: ((particle: Particle, dt: number) => void) | null;
+    /**
+     * Sub-emitter hook, fired when a particle is released by LIFE EXPIRY (not a bounds
+     * cull, not `clear()`/`destroy()`). The particle still holds its death position, so
+     * the hook can `emit()` more particles from it (a dying spark spawning embers). A
+     * particle emitted here is integrated on the NEXT frame, not this one.
+     */
+    onDeath?: ((particle: Particle) => void) | null;
+    /**
+     * Cap on `onDeath` cascade depth (sparks emitting sparks). Generations are tracked
+     * per particle; an `emit()` that would exceed this THROWS a `RangeError`. @default 8
+     */
+    maxCascadeDepth?: number;
     /** Off-screen culling rectangle. */
     bounds?: Bounds | null;
     /** Emission shape, sampled at emit time. Config `x`/`y` still override it. */
     zone?: EmissionZone | null;
+    /**
+     * Easing curves baked into `Float32Array` LUTs at construction and read on the hot
+     * path via {@link Emitter.curve} / {@link Emitter.curveTable} — no `Math.*` per
+     * frame. Each entry is any `(t: number) => number` (e.g. from `@zakkster/lite-ease`).
+     */
+    curves?: Record<string, (t: number) => number> | null;
+    /** LUT resolution per curve. @default 256 */
+    curveSegments?: number;
     /**
      * RNG seed. Same seed => same emission sequence. Mirrors
      * `createConfetti(canvas, { seed })` exactly: the emitter builds and owns its
@@ -122,6 +142,8 @@ export declare class Emitter {
     constructor(options?: EmitterOptions);
 
     onUpdate: ((particle: Particle, dt: number) => void) | null;
+    /** Sub-emitter hook fired on life-expiry. See {@link EmitterOptions.onDeath}. */
+    onDeath: ((particle: Particle) => void) | null;
     bounds: Bounds | null;
     /** Mutable — move a `point` zone by writing `emitter.zone.x`. Use setZone() to change shape. */
     zone: EmissionZone | null;
@@ -148,6 +170,29 @@ export declare class Emitter {
     setZone(zone: EmissionZone | null): void;
 
     /**
+     * Make the emission zone track a moving target (WORLD-SPACE): each `update()` moves
+     * the zone ORIGIN to `target.x`/`target.y` — two reads, O(1), never per-particle.
+     * Already-emitted particles stay where they were born (a comet trail). Pass `null`
+     * to stop. Throws if no zone is set. A `null`/non-finite target is a per-frame no-op
+     * (the zone stays put, no `NaN`).
+     */
+    follow(target: { x: number; y: number } | null): void;
+
+    /**
+     * The baked sampler for a configured curve: `emitter.curve('size')(normalizedLife)`
+     * returns the eased value with no easing math on the hot path (a table read + lerp).
+     * Hoist it out of your render loop — it is a stable closure. Throws if the name was
+     * not configured via `curves`.
+     */
+    curve(name: string): (t: number) => number;
+
+    /**
+     * The raw `Float32Array` LUT behind a configured curve, for a bare index instead of
+     * the interpolating sampler. Throws if the name was not configured.
+     */
+    curveTable(name: string): Float32Array;
+
+    /**
      * Spawn one particle. Returns it, or `null` when it cannot be spawned.
      *
      * Config keys must be particle fields — an unknown key **throws** a `TypeError`
@@ -155,6 +200,9 @@ export declare class Emitter {
      * (give either and the other mirrors it); an effective non-positive or non-finite
      * lifespan returns `null` rather than a dead-on-arrival particle. Returns `null`
      * when the pool is full.
+     *
+     * Called from inside `onDeath`, it tags the newborn one cascade generation deeper
+     * and **throws** a `RangeError` past `maxCascadeDepth`.
      */
     emit(config?: Partial<Particle>): Particle | null;
 
