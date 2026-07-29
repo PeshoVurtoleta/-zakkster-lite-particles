@@ -1,11 +1,12 @@
 # 0002 -- The two runtime dependencies
 
-- **Status:** accepted (records the question and a recommendation; **no
-  dependency changed in P0**)
-- **Date:** 2026-07-29
-- **Session:** P0 (v1.1.1)
+- **Status:** accepted; **option B executed in P1 (v1.2.0)** for the object pool.
+  `lite-object-pool` is removed; `@zakkster/lite-random` is kept, deliberately.
+  Originally written in P0 with no dependency changed.
+- **Date:** 2026-07-29 (P0); updated 2026-07-29 (P1 -- executed)
+- **Sessions:** P0 (v1.1.1) recorded the question; P1 (v1.2.0) acted
 - **Findings:** LP-11 (S3)
-- **Blocks on for action:** P1 (v1.2.0)
+- **See also:** decisions/0003 (the inline free-list that replaced the pool)
 
 ## Context
 
@@ -76,8 +77,35 @@ rescoped. This record fixes the question in writing and hands P1 a
 recommendation with its reasoning, so the dependency move is made deliberately
 inside the allocation session, not as an untracked side effect.
 
+## What P1 (v1.2.0) actually did
+
+**The pool: option B, executed.** `lite-object-pool` is gone. Its `acquire`/
+`release`/`forEachActive` were replaced by an inline `ParticlePool` dense
+free-list in `Emitter.js` (decisions/0003) -- which was the LP-02/LP-03
+allocation fix anyway, so B cost P1 nothing beyond work it was already doing, and
+it is the structure P4's SoA core builds on. LP-11's substantive half (a runtime
+pool dependency at all) and cosmetic half (an unscoped name) both resolve.
+
+**lite-random: kept, deliberately.** The smaller question resolved toward keeping
+the dep, for a reason that only surfaced under scrutiny: the emitter's public
+`random` getter **re-exposes the entire `Random` API** (`.gaussian`, `.int`,
+`.range`, `.weighted`, ...), documented "so a configFn can share the stream."
+Inlining only the `next()`/`reset()` the emitter itself calls would silently break
+every caller reaching through that getter -- a public API break outside P1's
+non-goals. Inlining the *whole* class would duplicate a maintained, in-scope,
+zero-dependency package and take on a keep-in-sync burden for no user benefit. So
+`@zakkster/lite-random` stays a dependency.
+
+Because the package is therefore not dependency-free, the README and llms.txt were
+reworded to say so honestly -- "one dependency (`@zakkster/lite-random`)" rather
+than "zero dependencies" -- exactly the path ROADMAP P4 sanctions ("lite-random
+remains, and the README says so"). P4 revisits this only if the SoA rewrite stops
+needing the full PRNG surface.
+
 ## References
 
-- `package.json` -- `dependencies`.
+- `package.json` -- `dependencies` (now only `@zakkster/lite-random`).
+- `Emitter.js` -- `ParticlePool` (the inlined pool); the `random` getter.
 - `ROADMAP.md` -- findings LP-11, LP-03; briefs P1 and P4.
-- `decisions/0001-hot-path-closure.md` -- LP-02/LP-03, the fix P1 owns.
+- `decisions/0001-hot-path-closure.md` -- LP-02/LP-03, resolved in P1.
+- `decisions/0003-allocation-fix-location.md` -- the inline free-list decision.

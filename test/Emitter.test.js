@@ -92,6 +92,68 @@ describe('lite-particles', () => {
         });
     });
 
+    describe('emitEach()', () => {
+        it('writes fields directly onto each particle (no config object)', () => {
+            emitter.emitEach(3, (p, i) => { p.x = i * 10; p.y = i; p.life = 1; });
+            const xs = [];
+            emitter.draw(null, (_c, p) => xs.push(p.x));
+            assert.equal(emitter.activeCount, 3);
+            assert.deepEqual(xs.sort((a, b) => a - b), [0, 10, 20]);
+        });
+
+        it('passes (particle, index) to initFn', () => {
+            const seen = [];
+            emitter.emitEach(3, (p, i) => { seen.push(i); p.life = 1; });
+            assert.deepEqual(seen, [0, 1, 2]);
+        });
+
+        it('returns how many actually spawned', () => {
+            const e = new Emitter({ maxParticles: 10 });
+            assert.equal(e.emitEach(4, (p) => { p.life = 1; }), 4);
+        });
+
+        it('stops when the pool fills and reports the short count', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            assert.equal(e.emitEach(10, (p) => { p.life = 1; }), 5);
+            assert.equal(e.activeCount, 5);
+        });
+
+        it('checks capacity BEFORE initFn - a saturated slot never runs initFn (LP-09)', () => {
+            const e = new Emitter({ maxParticles: 3 });
+            let calls = 0;
+            e.emitEach(50, (p) => { calls++; p.life = 1; });
+            assert.equal(calls, 3); // exactly the 3 that fit, never the 47 rejected
+        });
+
+        it('a saturated burst burns no rng draw, so replay survives saturation (LP-09)', () => {
+            const zone = { type: 'rect', x: 0, y: 0, width: 100, height: 100 };
+            const roomy = new Emitter({ maxParticles: 10, seed: 77, zone });
+            roomy.emitEach(3, (p) => { p.life = 1; });
+            const expected = positions(roomy);
+
+            // A pool of 3 hammered with 50: the 47 rejected must not advance the stream.
+            const tight = new Emitter({ maxParticles: 3, seed: 77, zone });
+            assert.equal(tight.emitEach(50, (p) => { p.life = 1; }), 3);
+            assert.deepEqual(positions(tight), expected);
+        });
+
+        it('samples the zone first; initFn can override (config-wins parity with emit)', () => {
+            const zone = { type: 'point', x: 100, y: 200 };
+            const e = new Emitter({ maxParticles: 5, zone });
+            e.emitEach(1, (p) => { p.life = 1; });           // no override -> zone position
+            e.emitEach(1, (p) => { p.life = 1; p.x = 7; });  // override x, keep zone y
+            const pos = positions(e);
+            assert.deepEqual(pos[0], { x: 100, y: 200 });
+            assert.deepEqual(pos[1], { x: 7, y: 200 });
+        });
+
+        it('is a no-op after destroy(), returning 0', () => {
+            const e = new Emitter({ maxParticles: 5 });
+            e.destroy();
+            assert.equal(e.emitEach(3, (p) => { p.life = 1; }), 0);
+        });
+    });
+
     describe('update()', () => {
         it('decrements particle life', () => {
             const p = emitter.emit({ life: 1, maxLife: 1 });

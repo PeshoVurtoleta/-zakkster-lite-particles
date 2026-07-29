@@ -19,7 +19,7 @@ Most particle libraries on npm ship with a Canvas or WebGL renderer baked in. Th
 
 `@zakkster/lite-particles` is **headless by design:**
 
-- **GC-free** — built on `lite-object-pool`. Objects are preallocated and recycled. No `new` in your game loop, no GC pauses at 60fps
+- **GC-free** — `update()` and `draw()` allocate **0 bytes per call** at every particle count (measured; enforced by a torture gate). Particles are preallocated in an inline dense free-list and recycled. No `new` in your game loop, no GC pauses at 60fps
 - **Bring your own renderer** — the `draw()` callback gives you the particle and a normalized life value. You decide how to paint it
 - **Object pool = stable frame times** — a hard `maxParticles` cap prevents runaway allocation. Pool full? `emit()` returns `null`. No crash, no stutter
 - **Real physics** — gravity, frame-independent drag, velocity integration. Not just "move dots randomly"
@@ -32,6 +32,8 @@ Most particle libraries on npm ship with a Canvas or WebGL renderer baked in. Th
 npm install @zakkster/lite-particles
 ```
 
+One runtime dependency: [`@zakkster/lite-random`](https://www.npmjs.com/package/@zakkster/lite-random) (itself zero-dependency), which powers seeded determinism and is re-exposed in full through `emitter.random`.
+
 ## Quick Start
 
 ```javascript
@@ -39,17 +41,17 @@ import { Emitter } from '@zakkster/lite-particles';
 
 const emitter = new Emitter({ maxParticles: 500 });
 
-// Spawn a burst
-emitter.emitBurst(50, (i) => ({
-    x: 400, y: 300,
-    vx: Math.cos(i * 0.5) * 200,
-    vy: -Math.random() * 400,
-    gravity: 600,
-    drag: 0.98,
-    life: 1.5,
-    maxLife: 1.5,
-    size: 4,
-}));
+// Spawn a burst (allocation-free: write fields straight onto each particle)
+emitter.emitEach(50, (p, i) => {
+    p.x = 400; p.y = 300;
+    p.vx = Math.cos(i * 0.5) * 200;
+    p.vy = -Math.random() * 400;
+    p.gravity = 600;
+    p.drag = 0.98;
+    p.life = 1.5;
+    p.maxLife = 1.5;
+    p.size = 4;
+});
 
 // Game loop
 function frame(now) {
@@ -111,7 +113,8 @@ function frame(now) {
 | Method | Description |
 |--------|-------------|
 | `.emit(config)` | Spawn one particle. Returns it, or `null` if pool is full. |
-| `.emitBurst(count, configFn)` | Spawn many. `configFn(index)` returns config. Stops at pool limit. **Returns how many actually spawned.** |
+| `.emitEach(count, initFn)` | Spawn many, **allocation-free**. `initFn(particle, index)` writes fields onto the particle directly. Capacity is checked before `initFn`, so a full pool burns no rng draw. Stops at pool limit. **Returns how many actually spawned.** |
+| `.emitBurst(count, configFn)` | **Deprecated (v1.2.0, removed in v2.0.0)** — use `.emitEach`. `configFn(index)` returns a config object per particle (one allocation each). Stops at pool limit. **Returns how many actually spawned.** |
 | `.update(dt)` | Physics tick. **dt in seconds.** |
 | `.draw(ctx, callback)` | Iterate for rendering. Callback: `(ctx, particle, normalizedLife)`. |
 | `.clear()` | Kill all particles instantly. Great for scene resets. |

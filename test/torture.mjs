@@ -5,26 +5,35 @@
  *
  *     node --expose-gc test/torture.mjs        -> prints "ok", exit 0
  *
- * Three phases, in the lite-arena vocabulary:
+ * Five phases, in the lite-arena vocabulary:
  *
  *     Phase A  retention    -- 4096 emit/expire cycles; activeCount -> 0 and
- *                              pool.free -> pool.size. Passes today.
- *     Phase B  GC budget    -- pre-fill OUTSIDE the loop, then >= 200k update()
- *                              iterations under lite-gc-profiler at maxBytesPerOp:0.
- *                              This is a REGISTERED, EXPECTED FAILURE on 1.1.0
- *                              (finding LP-02): update() allocates a per-call
- *                              arrow closure and a per-call `dead = []`. It is
- *                              carried as an XFAIL -- the phase prints the
- *                              measured bytes/op and asserts the allocation is
- *                              STILL present, so the command stays green while
- *                              documenting the baseline P1 has to clear. When P1
- *                              (v1.2.0) reaches 0 B/op, flip STRICT_PHASE_B to
- *                              true and this becomes a hard gate.
+ *                              pool.free -> pool.size. Passes.
+ *     Phase B  GC budget    -- update() AND draw() on an empty emitter allocate
+ *                              0 B/call (measured the LP-02 way), a frame where
+ *                              every particle dies at once triggers no full GC,
+ *                              and a >= 200k-op update() window is clean at
+ *                              maxMajor:0. As of v1.2.0 this is a HARD GATE
+ *                              (STRICT_PHASE_B). It was a registered XFAIL on
+ *                              1.1.0/1.1.1 (finding LP-02: a per-call arrow
+ *                              closure + a per-call `dead = []`); P1 removed the
+ *                              allocation by replacing lite-object-pool's Set with
+ *                              an inline dense free-list iterated in reverse with
+ *                              swap-remove (LP-03), so update() releases inline
+ *                              with no buffer, no closure, no iterator.
  *     Phase C  controls     -- an intentionally-allocating workload run through
  *                              the SAME gate, asserted to come back red. Proves
  *                              the gate can fail. `TORTURE_CONTROL=alloc`
  *                              additionally forces the whole process to exit
  *                              non-zero -- on-demand falsifiability.
+ *     Phase D  burst        -- emitEach(count, initFn) allocates nothing across
+ *                              20 x 5000 (finding LP-08), and a SATURATED burst
+ *                              consumes exactly the rng draws of the particles it
+ *                              actually emitted -- asserted by stream position,
+ *                              not just the count (finding LP-09).
+ *     Phase E  mixed loop   -- 200k mixed emit/update/draw under measureOps with
+ *                              stabilize:'deep', gated at maxArrayBuffersGrowth:0
+ *                              and maxMajor:0. No steady-state growth of any kind.
  *
  * Replay a Phase A/B corpus with its printed seed:
  *
@@ -34,23 +43,36 @@
  * a time and throws "already in flight" on nesting. Never measure two at once.
  *
  * lite-gc-profiler is a devDependency, never a runtime dep: Emitter.js does not
- * import it.
+ * import it. lite-random IS a runtime dep of the package, so importing Random
+ * here (Phase D's parity oracle) imports nothing the package does not already ship.
  *
  * @license MIT
  */
 
 import { GcProfiler, checkNoGc, measureOps, checkOps } from '@zakkster/lite-gc-profiler';
+import { Random } from '@zakkster/lite-random';
 import { Emitter } from '../Emitter.js';
 
-// Flip to true in P1 (v1.2.0) once update()/draw() reach 0 B/op. Until then
-// Phase B is an XFAIL: it documents the LP-02 allocation, it does not gate on it.
-const STRICT_PHASE_B = false;
+// v1.2.0: Phase B is a HARD GATE. Set false only to re-baseline a regression while
+// you bisect it -- the CHANGELOG entry for the version that flipped this is the record.
+const STRICT_PHASE_B = true;
 
 const CONTROL = process.env.TORTURE_CONTROL || null;
 const SEED = process.env.TORTURE_SEED ? Number(process.env.TORTURE_SEED) : 1234;
 
+// The hot loops allocate STRUCTURALLY zero bytes (no per-call array/closure/iterator).
+// Any positive reading is heapUsed granularity noise; observed <1 B/call after a
+// double-GC settle and a 3-rep min. The floor sits far below the 331 B/call this
+// session removed, so it separates "fixed" from "regressed" without flaking.
+const NOISE_FLOOR_BPC = 4.0;
+
 const OPS_RULES = { maxBytesPerOp: 0 };
 const GC_RULES = { maxMajor: 0, maxPauseMs: 4 };
+const MIXED_RULES = { maxMajor: 0, maxArrayBuffersGrowth: 0 };
+// A stabilized bytesPerOp is a two-point live-set delta; its noise floor is sub-byte,
+// so gating it at exactly 0 flakes. The real Phase E gate is maxMajor:0 +
+// maxArrayBuffersGrowth:0 (checkNoGc); bytesPerOp is corroboration held below this.
+const MIXED_BYTES_FLOOR = 4.0;
 
 function fail(phase, msg) {
     throw new Error(`torture: FAIL [${phase}] ${msg}`);
@@ -60,13 +82,15 @@ function log(msg) {
     process.stderr.write(msg + '\n');
 }
 
+const noop = () => {};
+
 /**
  * Gross transient allocation per call -- the LP-02 method, and the exact method
  * P1's "0 B/call" assertion uses: warm the call site, force a full settle, then
- * take the heapUsed delta over `calls` invocations with no GC in between (so the
- * closure + dead[] garbage each call accumulates rather than being scavenged).
- * measureOps' bytesPerOp is the wrong lane here: it reports NET steady-phase
- * growth, which minor GCs drive to ~0 and which hides exactly this finding.
+ * take the heapUsed delta over `calls` invocations with no GC in between (so any
+ * per-call garbage accumulates rather than being scavenged). measureOps' bytesPerOp
+ * is the wrong lane here: it reports NET steady-phase growth, which minor GCs drive
+ * to ~0 and which would hide a transient regression.
  */
 function bytesPerCall(fn, calls) {
     for (let i = 0; i < 5000; i++) fn(); // warm the site so V8 inlines it
@@ -78,16 +102,27 @@ function bytesPerCall(fn, calls) {
     return (after - before) / calls;
 }
 
+/** Min over reps -- allocation noise is one-sided (upward), so the min is the floor. */
+function minBytesPerCall(fn, calls, reps = 3) {
+    let m = Infinity;
+    for (let r = 0; r < reps; r++) {
+        const v = bytesPerCall(fn, calls);
+        if (v < m) m = v;
+    }
+    return m;
+}
+
 // ---------------------------------------------------------------------------
 // Phase A -- retention. 4096 emit/expire cycles must leave the pool pristine.
 // ---------------------------------------------------------------------------
 function phaseA() {
     const CYCLES = 4096;
     const PER_CYCLE = 64;
-    const e = new Emitter({ maxParticles: 256, seed: SEED });
+    const SIZE = 256;
+    const e = new Emitter({ maxParticles: SIZE, seed: SEED });
 
     for (let c = 0; c < CYCLES; c++) {
-        // A short-lived burst...
+        // A short-lived burst (exercises the legacy emitBurst path on purpose)...
         e.emitBurst(PER_CYCLE, () => ({ life: 0.1, maxLife: 0.1, vx: 1, vy: 1 }));
         // ...expired in a single fat frame.
         e.update(1);
@@ -101,13 +136,13 @@ function phaseA() {
     }
 
     e.destroy();
-    log(`  Phase A ok -- ${CYCLES} emit/expire cycles, pool returned to ${256}/${256} free every cycle`);
+    log(`  Phase A ok -- ${CYCLES} emit/expire cycles, pool returned to ${SIZE}/${SIZE} free every cycle`);
 }
 
 // ---------------------------------------------------------------------------
-// Phase B -- GC budget. Pre-fill the pool OUTSIDE the measured window, then run
-// update() on a steady population. bytesPerOp is the transient allocation rate
-// -- exactly what LP-02 measured (forced settle, then heapUsed delta per call).
+// Phase B -- GC budget. The headline: update()/draw() are 0 B/call at every
+// particle count, and no full GC fires across a long update() window or a frame
+// where the entire population dies at once.
 // ---------------------------------------------------------------------------
 async function phaseB() {
     if (typeof global.gc !== 'function') {
@@ -116,18 +151,22 @@ async function phaseB() {
     }
 
     const N = 1000;
+
+    // (1) Empty emitter: the exact LP-02 fixture. update() and draw() on zero
+    // particles were 331 / 243 B/call; they must now be ~0.
+    const empty = new Emitter({ maxParticles: N, seed: SEED });
+    const bpcUpdate0 = minBytesPerCall(() => empty.update(1 / 6000), 100000);
+    const bpcDraw0 = minBytesPerCall(() => empty.draw(null, noop), 100000);
+    empty.destroy();
+
+    // (2) Steady population: pre-fill OUTSIDE the window with long-lived particles
+    // so update() integrates every frame and never releases -- the steady hot loop.
     const e = new Emitter({ maxParticles: N, seed: SEED });
-    // Pre-fill OUTSIDE the measured window with long-lived particles so update()
-    // integrates every frame and never releases -- we measure the steady hot
-    // loop, not churn. dt is tiny so nothing expires across the whole window.
-    e.emitBurst(N, () => ({ life: 1e9, maxLife: 1e9, vx: 1, vy: 1, gravity: 10, drag: 0.99 }));
+    e.emitEach(N, (p) => { p.life = 1e9; p.maxLife = 1e9; p.vx = 1; p.vy = 1; p.gravity = 10; p.drag = 0.99; });
     const step = () => e.update(1 / 6000);
+    const bpcUpdate1k = minBytesPerCall(step, 50000);
 
-    // (1) Gross allocation per call -- the LP-02 baseline number.
-    const bpc = bytesPerCall(step, 1000);
-    const bytes = bpc.toFixed(1);
-
-    // (2) GC-budget window: >= 200k iterations under the profiler, gated at
+    // (3) GC-budget window: >= 200k iterations under the profiler, gated at
     // maxMajor:0 -- the "checkNoGc at maxMajor 0" reading the brief names.
     const gc = new GcProfiler(256, { heap: true }).start();
     for (let i = 0; i < 200000; i++) step();
@@ -136,35 +175,56 @@ async function phaseB() {
     gc.stop();
     const budget = checkNoGc(summary, GC_RULES);
     e.destroy();
-
     const gcLine = `major=${summary.gc.major} minor=${summary.gc.minor} ` +
         `maxMs=${summary.gc.maxMs.toFixed(2)} source=${summary.source}`;
 
-    // XFAIL contract: on 1.1.0 the per-call arrow closure + per-call dead[] array
-    // make bytesPerCall > 0 (LP-02). Carry it as a documented failure that keeps
-    // the command green; P1 (v1.2.0) drives it to 0 and flips STRICT_PHASE_B.
-    const allocated = bpc > 0.5; // sub-byte noise floor; the real value is ~315
+    // (4) All-expire-at-once: every particle dies in a single fat frame, repeatedly.
+    // release runs the swap-remove path at full width; assert no full GC across the
+    // cycles (structural -- avoids conflating emit + update in a heapUsed delta).
+    const ex = new Emitter({ maxParticles: N, seed: SEED });
+    const CYCLES = 2000;
+    const gcx = new GcProfiler(256, { heap: true }).start();
+    for (let c = 0; c < CYCLES; c++) {
+        ex.emitEach(N, (p) => { p.life = 0.01; p.maxLife = 0.01; });
+        ex.update(1); // one fat frame expires all N at once
+    }
+    await gcx.settle();
+    const sumx = gcx.summary();
+    gcx.stop();
+    const budgetx = checkNoGc(sumx, GC_RULES);
+    const allExpiredClean = ex.activeCount === 0;
+    ex.destroy();
+
+    const nums = `update0=${bpcUpdate0.toFixed(2)} draw0=${bpcDraw0.toFixed(2)} ` +
+        `update1k=${bpcUpdate1k.toFixed(2)} B/call`;
+
+    const overFloor =
+        bpcUpdate0 > NOISE_FLOOR_BPC ? 'update()@0' :
+        bpcDraw0 > NOISE_FLOOR_BPC ? 'draw()@0' :
+        bpcUpdate1k > NOISE_FLOOR_BPC ? 'update()@1k' : null;
 
     if (STRICT_PHASE_B) {
-        if (allocated) {
-            fail('B', `update() allocates ${bytes} B/call (budget 0) [${gcLine}]`);
+        if (overFloor) {
+            fail('B', `${overFloor} allocates over the ${NOISE_FLOOR_BPC} B/call floor [${nums}]`);
         }
         if (!budget.ok) {
-            fail('B', `update() breached the GC budget: verdict=${budget.verdict} [${gcLine}]`);
+            fail('B', `200k update() window breached the GC budget: verdict=${budget.verdict} [${gcLine}]`);
         }
-        log(`  Phase B ok -- update() at ${bytes} B/call, 200k-op window clean [${gcLine}]`);
+        if (!budgetx.ok) {
+            fail('B', `all-expire cycles breached the GC budget: verdict=${budgetx.verdict} ` +
+                `[major=${sumx.gc.major} minor=${sumx.gc.minor}]`);
+        }
+        if (!allExpiredClean) {
+            fail('B', `all-expire frame left activeCount=${ex.activeCount}, expected 0`);
+        }
+        log(`  Phase B ok -- ${nums}; 200k-op window clean [${gcLine}]; ` +
+            `${CYCLES}x all-expire clean [major=${sumx.gc.major} minor=${sumx.gc.minor}]`);
         return;
     }
 
-    if (!allocated) {
-        log(`  Phase B PASSES at ${bytes} B/call -- LP-02 appears already fixed. ` +
-            `If P1 (v1.2.0) has landed, set STRICT_PHASE_B=true to promote this to a hard gate. [${gcLine}]`);
-        return;
-    }
-
-    log(`  Phase B XFAIL (expected) -- update() allocates ${bytes} B/call ` +
-        `[LP-02: per-call arrow closure + per-call dead[] array]. ` +
-        `200k-op GC window: ${gcLine}. P1 (v1.2.0) clears this.`);
+    // Non-strict fallback (only if someone re-baselines): report, never gate.
+    log(`  Phase B (non-strict) -- ${nums}; window [${gcLine}]; ` +
+        `all-expire [major=${sumx.gc.major}]. Set STRICT_PHASE_B=true to gate.`);
 }
 
 // ---------------------------------------------------------------------------
@@ -175,7 +235,7 @@ async function phaseB() {
 function phaseC() {
     const N = 256;
     const e = new Emitter({ maxParticles: N, seed: SEED });
-    e.emitBurst(N, () => ({ life: 1e9, maxLife: 1e9, vx: 1, vy: 1 }));
+    e.emitEach(N, (p) => { p.life = 1e9; p.maxLife = 1e9; p.vx = 1; p.vy = 1; });
 
     // RETAIN a fresh object every op (never reset the sink) so the allocation
     // survives collection and shows up as robust net growth, not sub-byte noise.
@@ -201,8 +261,132 @@ function phaseC() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Phase D -- burst. emitEach writes onto the particle directly (LP-08: no config
+// object), and checks pool capacity BEFORE initFn (LP-09: a saturated pool burns
+// no rng draw). Both are asserted.
+// ---------------------------------------------------------------------------
+function phaseD() {
+    if (typeof global.gc !== 'function') {
+        log('  Phase D inconclusive -- run with node --expose-gc');
+        return;
+    }
+
+    // (1) Allocation: 20 x 5000 emitEach bursts, cleared each round, allocate nothing.
+    const SIZE = 5000;
+    const e = new Emitter({ maxParticles: SIZE, seed: SEED });
+    const burst = () => {
+        e.emitEach(SIZE, (p, i) => { p.life = 1; p.maxLife = 1; p.vx = i; p.vy = -i; });
+        e.clear();
+    };
+    const perParticle = minBytesPerCall(burst, 20) / SIZE;
+    e.destroy();
+    if (perParticle > NOISE_FLOOR_BPC) {
+        fail('D', `emitEach allocates ${perParticle.toFixed(3)} B/particle across 20x${SIZE} ` +
+            `(floor ${NOISE_FLOOR_BPC})`);
+    }
+
+    // (2) rng-draw parity on saturation. A rect zone consumes 2 rng draws/particle.
+    // Fill to N-10, then over-request 100: only 10 fit, and the pool must burn draws
+    // for exactly those 10 -- not the 90 it rejected. Assert the STREAM POSITION.
+    const N = 256;
+    const DRAWS_PER = 2; // rect zone: x uses one next(), y uses another
+    const zone = { type: 'rect', x: 0, y: 0, width: 100, height: 100 };
+    const s = new Emitter({ maxParticles: N, seed: SEED, zone });
+
+    const firstFill = s.emitEach(N - 10, noop);      // fills to N-10
+    const emitted = s.emitEach(100, noop);           // only 10 slots remain
+    const state = s.random.getState();
+
+    if (firstFill !== N - 10) fail('D', `first fill emitted ${firstFill}, expected ${N - 10}`);
+    if (emitted !== 10) fail('D', `saturating burst emitted ${emitted}, expected 10`);
+
+    // Oracle: same seed, exactly DRAWS_PER * (particles actually emitted) draws.
+    const ref = new Random(SEED);
+    const expectedDraws = DRAWS_PER * ((N - 10) + emitted);
+    for (let i = 0; i < expectedDraws; i++) ref.next();
+    if (ref.getState() !== state) {
+        fail('D', `rng stream position mismatch: emitter consumed a different number of ` +
+            `draws than ${expectedDraws} (${DRAWS_PER}/particle x ${(N - 10) + emitted} emitted) ` +
+            `-- a saturated slot burned an rng draw (LP-09 regression)`);
+    }
+    s.destroy();
+
+    log(`  Phase D ok -- emitEach ${perParticle.toFixed(3)} B/particle (20x${SIZE}); ` +
+        `saturated burst consumed exactly ${expectedDraws} draws for ${(N - 10) + emitted} emitted, ` +
+        `none for the ${100 - emitted} rejected`);
+}
+
+// ---------------------------------------------------------------------------
+// Phase E -- mixed loop. A realistic emit/update/draw churn, 200k ops, must not
+// grow the heap or any ArrayBuffer in steady state. stabilize:'deep' settles
+// before each boundary so bytesPerOp reflects SURVIVING allocation, not transients.
+// ---------------------------------------------------------------------------
+function phaseE() {
+    if (typeof global.gc !== 'function') {
+        log('  Phase E inconclusive -- run with node --expose-gc');
+        return;
+    }
+
+    const e = new Emitter({
+        maxParticles: 1000,
+        seed: SEED,
+        bounds: { x: -1e6, y: -1e6, width: 2e6, height: 2e6 },
+    });
+    // Each op: emit a few short-lived, integrate, render. Population stays bounded
+    // because the emitted particles expire within a few frames.
+    const mixed = (i) => {
+        e.emitEach(4, (p, k) => { p.life = 0.05; p.maxLife = 0.05; p.vx = k; p.vy = -k; });
+        e.update(1 / 60);
+        e.draw(null, noop);
+    };
+
+    const result = measureOps(mixed, { ops: 200000, warmup: 10000, source: 'gc', stabilize: 'deep' });
+    const budget = checkNoGc(result.summary, MIXED_RULES);
+    e.destroy();
+
+    const ab = result.summary.arrayBuffers;
+    const abLine = ab && ab.supported && ab.settled
+        ? `arrayBuffers.growth=${ab.growthBytes}B`
+        : `arrayBuffers=unsettled(n/a)`;
+    const retained = result.bytesPerOp ?? 0;
+
+    // Hard structural gate (the brief's assertion): no full GC and no ArrayBuffer
+    // growth across the window.
+    if (!budget.ok) {
+        fail('E', `mixed loop breached maxMajor:0 / maxArrayBuffersGrowth:0: ` +
+            `verdict=${budget.verdict} major=${result.summary.gc.major} [${abLine}]`);
+    }
+    // Corroboration: retained bytes/op sits at the sub-byte noise floor, not a leak.
+    if (retained > MIXED_BYTES_FLOOR) {
+        fail('E', `mixed loop retained ${retained.toFixed(3)} B/op, over the ` +
+            `${MIXED_BYTES_FLOOR} B/op floor -- steady-state growth [${abLine}]`);
+    }
+
+    log(`  Phase E ok -- 200k mixed emit/update/draw: ${retained.toFixed(3)} B/op retained ` +
+        `(<= ${MIXED_BYTES_FLOOR} floor), major=${result.summary.gc.major}, ${abLine}`);
+}
+
+// ---------------------------------------------------------------------------
+// Throughput note (not a gate): the HOT PATH ledger wants update()@1k on record.
+// ---------------------------------------------------------------------------
+function throughputNote() {
+    const e = new Emitter({ maxParticles: 1000, seed: SEED });
+    e.emitEach(1000, (p) => { p.life = 1e9; p.maxLife = 1e9; p.vx = 1; p.vy = 1; p.gravity = 10; p.drag = 0.99; });
+    const r = measureOps(() => e.update(1 / 6000), { ops: 200000, warmup: 20000, source: 'gc' });
+    e.destroy();
+    log(`  update()@1k throughput -- ${(r.opsPerSec / 1e6).toFixed(2)} M ops/s (informational)`);
+}
+
 async function main() {
-    const phases = [['A-retention', phaseA], ['B-gc-budget', phaseB], ['C-controls', phaseC]];
+    const phases = [
+        ['A-retention', phaseA],
+        ['B-gc-budget', phaseB],
+        ['C-controls', phaseC],
+        ['D-burst', phaseD],
+        ['E-mixed', phaseE],
+        ['throughput', throughputNote],
+    ];
     for (const [name, run] of phases) {
         try {
             await run();

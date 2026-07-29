@@ -138,7 +138,26 @@ export declare class Emitter {
     /** Spawn one particle. Returns it, or `null` if the pool is full. */
     emit(config?: Partial<Particle>): Particle | null;
 
-    /** Spawn many. Returns how many actually spawned (< count when the pool saturates). */
+    /**
+     * Spawn many, writing fields directly onto each particle. Allocation-free:
+     * `initFn(p, i)` mutates the pooled particle in place instead of returning a
+     * config object. Pool capacity is checked BEFORE `initFn` runs, so a saturated
+     * pool consumes no rng draw for a particle it cannot emit. A set zone supplies
+     * the base x/y first; `initFn` runs after and can override.
+     * Returns how many actually spawned (< count when the pool saturates).
+     */
+    emitEach(count: number, initFn: (particle: Particle, i: number) => void): number;
+
+    /**
+     * Spawn many via a config-returning callback.
+     *
+     * @deprecated Since v1.2.0. Use {@link Emitter.emitEach}, which writes onto the
+     * particle directly and allocates nothing. This form allocates one object literal
+     * per particle and is removed in v2.0.0.
+     * Migrate: `emitBurst(n, i => ({vx: i}))` → `emitEach(n, (p, i) => { p.vx = i; })`.
+     *
+     * Returns how many actually spawned (< count when the pool saturates).
+     */
     emitBurst(count: number, configFn: (i: number) => Partial<Particle>): number;
 
     /** dt is in SECONDS. From rAF: `update((now - last) / 1000)`. */

@@ -2,28 +2,88 @@
  * @zakkster/lite-particles — Headless Particle Engine
  *
  * Handles GC-free physics, lifecycles, and bounds culling.
- * Uses lite-object-pool for O(1) acquire/release with double-release protection.
+ * Owns an inline dense free-list (see ParticlePool below) — no runtime object-pool
+ * dependency. One runtime dependency remains: @zakkster/lite-random, whose full API
+ * is re-exposed via the `random` getter.
  *
  * IMPORTANT: dt is in SECONDS (not milliseconds).
  * If using requestAnimationFrame, divide by 1000: emitter.update(dt / 1000)
  *
+ * v1.2.0 — GC-free made true: update()/draw() allocate 0 B/call at every particle
+ *          count (finding LP-02/LP-03), and emitEach() is an allocation-free burst.
  * v1.1.0 — emission zones, seeded determinism, recycledThisFrame.
  *
- * NOTE ON THE HOT PATH: update()'s `dead` array and its forEachActive closure look
- * like per-frame garbage, and hoisting them onto `this` is the obvious "zero-GC"
- * hardening. It was measured and rejected: V8's escape analysis already elides both
- * (allocation rate is ~0 B/frame either way), and moving the state onto `this` traded
- * fast context-slot reads for property loads — a consistent 7-8% throughput
- * regression. The closure stays.
+ * NOTE ON THE HOT PATH: v1.1.0's update() carried a per-call `dead` array and a
+ * forEachActive closure, and its header claimed escape analysis elided both at
+ * ~0 B/frame. Measurement disproved that (~331 B/call on an empty emitter). The
+ * header's OTHER claim held up: hoisting that state onto `this` costs a measured
+ * 7-8% throughput regression, so that was NOT the fix. The fix is the third option
+ * the old ledger never tested — a dense active array iterated in reverse with
+ * swap-remove, releasing inline, so the array, the closure and the Set iterator all
+ * disappear at once and nothing moves onto `this`. See decisions/0001.
  */
 
-import ObjectPool from 'lite-object-pool';
 import { Random } from '@zakkster/lite-random';
 
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = '1.1.1';
+export const VERSION = '1.2.0';
 
 const TAU = Math.PI * 2;
+
+/**
+ * Inline dense free-list — the O(1) pool that lite-object-pool used to provide,
+ * minus the per-call Set iterator that made the hot path allocate (LP-03).
+ *
+ * All particle objects are pre-allocated once into `slots`. Active particles occupy
+ * `slots[0 .. active-1]`; free ones occupy `slots[active .. size-1]`. acquire() takes
+ * the boundary slot; releaseAt(i) swap-removes — the last active particle fills the
+ * hole and the released one moves to the free region. That makes reverse iteration
+ * with in-place release safe (the swapped-in element sits above the cursor and has
+ * already been visited), which is the whole reason update() can drop its `dead[]`
+ * buffer. `slots` and `active` are read directly by update()/draw() so those loops
+ * need no callback.
+ */
+class ParticlePool {
+    constructor(size, create, reset) {
+        this._reset = reset;
+        this.size = size;
+        this.active = 0;
+        this.slots = new Array(size);
+        for (let i = 0; i < size; i++) this.slots[i] = create();
+    }
+
+    /** O(1). Returns a clean particle, or null when full. */
+    acquire() {
+        if (this.active >= this.size) return null;
+        return this.slots[this.active++];
+    }
+
+    /** O(1) swap-remove of the active particle at index `i`, then reset it. */
+    releaseAt(i) {
+        const slots = this.slots;
+        const last = --this.active;
+        const p = slots[i];
+        slots[i] = slots[last];
+        slots[last] = p;
+        this._reset(p);
+    }
+
+    /** Reset every active particle and empty the active region. */
+    releaseAll() {
+        const slots = this.slots;
+        for (let i = 0; i < this.active; i++) this._reset(slots[i]);
+        this.active = 0;
+    }
+
+    get used() { return this.active; }
+    get free() { return this.size - this.active; }
+
+    destroy() {
+        this.slots = null;
+        this._reset = null;
+        this.active = 0;
+    }
+}
 
 /** Zone kinds, and how many rng.next() draws each consumes per particle. */
 const ZONE_DRAWS = { point: 0, line: 1, rect: 2, ring: 1 }; // ring: 2 when it is an annulus
@@ -115,17 +175,18 @@ export class Emitter {
 
         this._recycledThisFrame = 0;
 
-        this.pool = new ObjectPool({
-            size: maxParticles,
-            expand: false, // Strict memory limit prevents GC spikes
-            create: () => ({
+        // Inline dense free-list. Strict, non-expanding memory limit (maxParticles)
+        // prevents GC spikes; a full pool returns null from acquire() rather than growing.
+        this.pool = new ParticlePool(
+            maxParticles,
+            () => ({
                 x: 0, y: 0,
                 vx: 0, vy: 0,
                 gravity: 0, drag: 1,
                 life: 0, maxLife: 1,
                 size: 1, data: null, // attach custom colors/sprites/metadata
             }),
-            reset: (p) => {
+            (p) => {
                 p.x = p.y = 0;
                 p.vx = p.vy = 0;
                 p.gravity = 0;
@@ -135,7 +196,7 @@ export class Emitter {
                 p.size = 1;
                 p.data = null;
             },
-        });
+        );
     }
 
     /** Number of particles currently alive. */
@@ -237,7 +298,42 @@ export class Emitter {
     }
 
     /**
+     * Spawn multiple particles at once, writing fields directly onto each particle.
+     * The allocation-free burst path — `initFn(p, i)` mutates the pooled particle in
+     * place instead of returning a config object, so a 5000-particle burst allocates
+     * nothing (finding LP-08).
+     *
+     * Pool capacity is checked BEFORE `initFn` runs, so a saturated pool consumes
+     * neither a call nor an rng draw for a particle it cannot emit (finding LP-09) —
+     * matching `_sampleZone`'s acquire-then-sample discipline.
+     *
+     * When a zone is set it supplies the base x/y first; `initFn` runs after and can
+     * override, mirroring `emit`'s "config wins" rule.
+     *
+     * @param {number}   count  How many to spawn
+     * @param {Function} initFn Receives (particle, index); writes fields onto the particle
+     * @returns {number} How many were actually emitted (< count when the pool saturated)
+     */
+    emitEach(count, initFn) {
+        if (this._destroyed) return 0;
+        let emitted = 0;
+        for (let i = 0; i < count; i++) {
+            const p = this.pool.acquire();
+            if (!p) break; // pool full — stop BEFORE calling initFn (no wasted rng draw)
+            if (this.zone !== null) this._sampleZone(p);
+            initFn(p, i);
+            emitted++;
+        }
+        return emitted;
+    }
+
+    /**
      * Spawn multiple particles at once. Stops early if the pool fills.
+     *
+     * @deprecated Since v1.2.0. Use {@link Emitter#emitEach}, whose `initFn(p, i)`
+     *   writes onto the particle directly and allocates nothing. This config-returning
+     *   form allocates one object literal per particle and is removed in v2.0.0.
+     *   Migrate: `emitBurst(n, i => ({vx: i}))` -> `emitEach(n, (p, i) => { p.vx = i; })`.
      *
      * @param {number}   count    How many to spawn
      * @param {Function} configFn Receives index i, returns config object
@@ -269,16 +365,24 @@ export class Emitter {
     update(dt) {
         if (this._destroyed) return;
 
-        // Collect dead particles separately to avoid modifying the Set
-        // during iteration (pool.forEachActive iterates _out)
-        const dead = [];
+        // Dense active array iterated in REVERSE, releasing in place with swap-remove
+        // (releaseAt). No `dead[]` buffer, no forEachActive closure, no Set iterator —
+        // 0 B/call at every particle count, including a frame where all die at once.
+        // Reverse + swap-remove is correct: releaseAt(i) moves the top active particle
+        // into slot i, and that element sits above the cursor, already visited.
+        const pool = this.pool;
+        const slots = pool.slots;
+        let deaths = 0;
+        let i = pool.active;
 
-        this.pool.forEachActive((p) => {
+        while (i-- > 0) {
+            const p = slots[i];
             p.life -= dt;
 
             if (p.life <= 0) {
-                dead.push(p);
-                return;
+                pool.releaseAt(i);
+                deaths++;
+                continue;
             }
 
             // Physics integration
@@ -299,20 +403,18 @@ export class Emitter {
                 const b = this.bounds;
                 if (p.x < b.x || p.x > b.x + b.width ||
                     p.y < b.y || p.y > b.y + b.height) {
-                    dead.push(p);
-                    return;
+                    pool.releaseAt(i);
+                    deaths++;
+                    continue;
                 }
             }
 
             // Custom user logic
             if (this.onUpdate) this.onUpdate(p, dt);
-        });
-
-        // Release dead particles after iteration
-        for (const p of dead) this.pool.release(p);
+        }
 
         // v1.1.0 — frame-perfect churn metric. Life expiry + bounds culls, nothing else.
-        this._recycledThisFrame = dead.length;
+        this._recycledThisFrame = deaths;
     }
 
     /**
@@ -324,10 +426,16 @@ export class Emitter {
     draw(ctx, renderCallback) {
         if (this._destroyed) return;
 
-        this.pool.forEachActive((p) => {
+        // Forward index loop over the dense active region — no closure, no iterator,
+        // 0 B/call. draw() never releases, so forward order is fine.
+        const pool = this.pool;
+        const slots = pool.slots;
+        const active = pool.active;
+        for (let i = 0; i < active; i++) {
+            const p = slots[i];
             const normalizedLife = Math.max(0, p.life / p.maxLife);
             renderCallback(ctx, p, normalizedLife);
-        });
+        }
     }
 
     /**

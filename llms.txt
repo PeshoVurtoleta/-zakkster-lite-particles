@@ -1,12 +1,12 @@
 # @zakkster/lite-particles
 
-> Zero-dependency headless particle engine. GC-free physics via lite-object-pool. dt in SECONDS.
+> Headless particle engine, GC-free physics (0 B/call update/draw). One dependency: @zakkster/lite-random. dt in SECONDS.
 
 ## Installation
 npm install @zakkster/lite-particles
 
 ## Dependencies
-lite-object-pool
+@zakkster/lite-random (the only runtime dependency; its full API is re-exposed via `.random`)
 
 ## Exports
 - `Emitter` — Class
@@ -19,7 +19,8 @@ lite-object-pool
 
 ## API
 - `.emit(config): particle | null` — Spawn one particle. Config: `{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }`. Returns null if pool full.
-- `.emitBurst(count, configFn)` — Spawn multiple. `configFn(index)` returns config per particle.
+- `.emitEach(count, initFn)` — Spawn multiple, allocation-free. `initFn(particle, index)` writes fields onto the particle directly (no config object). Capacity is checked before initFn, so a full pool burns no rng draw. Returns how many spawned.
+- `.emitBurst(count, configFn)` — DEPRECATED since v1.2.0 (removed in v2.0.0); use `.emitEach`. `configFn(index)` returns a config object per particle (one allocation each).
 - `.update(dt)` — Core physics tick. **dt must be in SECONDS** (divide rAF ms by 1000). Applies gravity, drag, velocity, bounds culling, then calls onUpdate hook.
 - `.draw(ctx, renderCallback)` — Iterate alive particles for rendering. `renderCallback(ctx, particle, normalizedLife)` where normalizedLife is 1.0 at birth → 0.0 at death.
 - `.clear()` — Kill all particles instantly (scene reset).
@@ -97,7 +98,31 @@ Pair with .activeCount and feed both to lite-profiler count().
 
 .emitBurst(count, configFn) now RETURNS how many actually spawned (< count when the pool saturates).
 
-### Hot path note
-update()'s local `dead` array and forEachActive closure are NOT hoisted onto `this`. That
-"zero-GC hardening" was measured and rejected: V8 escape analysis already elides them (~0 B/frame
-either way), and moving the state onto `this` cost a consistent 7-8% throughput regression.
+### Hot path note (superseded by v1.2.0 — see below)
+On 1.1.x update()'s local `dead` array and forEachActive closure were left un-hoisted on the
+theory that escape analysis elided them (~0 B/frame). Measurement disproved that (~331 B/call). See
+the v1.2.0 section; the header history is preserved in decisions/0001-hot-path-closure.md.
+
+## v1.2.0 — GC-free made true + allocation-free bursts
+
+### 0 B/call
+update() and draw() allocate 0 B/call at every particle count (were ~331 / ~243 on an empty
+emitter). The active set is a dense array iterated in reverse with swap-remove, so update()
+releases in place — no per-call `dead[]`, no forEachActive closure, no Set iterator. A 200k-op
+update() window triggers zero GCs (major=0, minor=0). Torture Phase B enforces this as a hard gate.
+Throughput is unchanged (100–110% of the 1.1.0 baseline; never slower). See decisions/0001 and 0003.
+
+Iteration order caveat: because the active set is now dense with swap-remove, update()/draw() visit
+particles in a different order than 1.1.0 after churn. Physics is per-particle independent so results
+are identical; only render z-order among simultaneously-live particles can differ. The emission
+stream (rng draws per seed) is unchanged.
+
+### emitEach
+`.emitEach(count, initFn)` is the allocation-free burst: `initFn(particle, index)` writes onto the
+pooled particle instead of returning a config object (no per-particle allocation), and capacity is
+checked before initFn so a saturated pool burns no rng draw (assert the stream position, not just
+the count). `.emitBurst` is deprecated in favour of it and removed in v2.0.0.
+
+### Dependencies
+lite-object-pool was removed — replaced by an inline dense free-list. @zakkster/lite-random remains
+the one runtime dependency because `.random` re-exposes its whole API to config callbacks.
