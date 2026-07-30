@@ -13,6 +13,10 @@ A headless particle engine with GC-free physics, lifecycle management, and bound
 
 **Bring your own renderer. We handle the physics.**
 
+![lite-particles playground — 100,000 particles rendered by packTo → lite-gl in one instanced draw](demo/screenshot.png)
+
+<sub>100,000 particles, one instanced GPU draw via `packTo` → [`@zakkster/lite-gl`](https://www.npmjs.com/package/@zakkster/lite-gl), 0 bytes/frame. Run it: [`demo/`](demo/).</sub>
+
 ## Why This Library?
 
 Most particle libraries on npm ship with a Canvas or WebGL renderer baked in. The moment you need to render differently — DOM elements, Three.js sprites, PixiJS, SVG, or a custom WebGL shader — you're fighting the library instead of using it.
@@ -35,6 +39,20 @@ npm install @zakkster/lite-particles
 ```
 
 One runtime dependency: [`@zakkster/lite-random`](https://www.npmjs.com/package/@zakkster/lite-random) (itself zero-dependency), which powers seeded determinism and is re-exposed in full through `emitter.random`.
+
+## Demo
+
+An interactive playground lives in [`demo/`](demo/) — five scenes (fountain, fireworks with `onDeath` cascades, ring shockwave, snow, vortex), cursor-`follow`, seeded replay, a live FPS/particle HUD, and a **Canvas2D ⇄ GPU toggle** that flips rendering to `packTo` → lite-gl and pushes past 100,000 particles in one instanced draw.
+
+It has no build step. Serve the monorepo root over HTTP and open the demo (it loads the engine and lite-gl from source via an import map):
+
+```bash
+# from the directory that contains LiteParticles/ (and LiteGL/, LiteSignal/, LiteRaf/)
+python3 -m http.server 8099
+# then open http://localhost:8099/LiteParticles/demo/
+```
+
+See [`demo/README.md`](demo/README.md) for details.
 
 ## Quick Start
 

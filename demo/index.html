@@ -1,0 +1,909 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>lite-particles · playground</title>
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap"
+          rel="stylesheet">
+    <style>
+        *, *::before, *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg-0: #07090d;
+            --bg-1: #0d1117;
+            --bg-2: #131922;
+            --line: rgba(255, 255, 255, 0.07);
+            --line-2: rgba(255, 255, 255, 0.14);
+            --text: #d8d6d2;
+            --dim: #8b8d94;
+            --faint: #565b63;
+            --green: #5fe39f;
+            --green: oklch(83% 0.14 158);
+            --cyan: #7dd3fc;
+            --cyan: oklch(83% 0.09 232);
+            --amber: #f5b942;
+            --amber: oklch(81% 0.14 82);
+            --magenta: #e879a8;
+            --magenta: oklch(72% 0.13 356);
+            --mono: 'JetBrains Mono', ui-monospace, monospace;
+            --display: 'Space Mono', var(--mono);
+        }
+
+        html, body {
+            height: 100%;
+            background: var(--bg-0);
+            color: var(--text);
+            font-family: var(--mono);
+            overflow: hidden;
+        }
+
+        body {
+            position: fixed;
+            inset: 0;
+        }
+
+        #stage {
+            position: absolute;
+            inset: 0;
+            touch-action: none;
+            cursor: crosshair;
+        }
+
+        #stage canvas {
+            position: absolute;
+            inset: 0;
+            width: 100%;
+            height: 100%;
+            display: block;
+        }
+
+        #cgl {
+            display: none;
+        }
+
+        /* radial vignette so particles glow against a deep center */
+        #vignette {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            background: radial-gradient(120% 120% at 50% 45%, transparent 55%, rgba(0, 0, 0, 0.55) 100%);
+        }
+
+        /* ---- Title ---- */
+        #brand {
+            position: absolute;
+            top: 18px;
+            left: 20px;
+            z-index: 5;
+            pointer-events: none;
+        }
+
+        #brand h1 {
+            font-family: var(--display);
+            font-weight: 700;
+            font-size: 18px;
+            letter-spacing: 0.02em;
+        }
+
+        #brand h1 .dot {
+            color: var(--faint);
+            font-weight: 400;
+        }
+
+        #brand h1 .lp {
+            color: var(--green);
+            text-shadow: 0 0 14px rgba(95, 227, 159, 0.5);
+        }
+
+        #brand .sub {
+            margin-top: 4px;
+            font-size: 11px;
+            color: var(--dim);
+            letter-spacing: 0.04em;
+        }
+
+        #brand .ver {
+            color: var(--amber);
+        }
+
+        /* ---- Control panel ---- */
+        #panel {
+            position: absolute;
+            left: 20px;
+            bottom: 20px;
+            z-index: 6;
+            width: 260px;
+            max-width: calc(100vw - 40px);
+            background: color-mix(in srgb, var(--bg-1) 82%, transparent);
+            border: 1px solid var(--line);
+            border-radius: 12px;
+            padding: 14px;
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+        }
+
+        .grp {
+            margin-bottom: 12px;
+        }
+
+        .grp:last-child {
+            margin-bottom: 0;
+        }
+
+        .grp > .lbl {
+            font-size: 10px;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            color: var(--faint);
+            margin-bottom: 7px;
+        }
+
+        .row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        button.chip {
+            font-family: var(--mono);
+            font-size: 12px;
+            color: var(--dim);
+            background: var(--bg-2);
+            border: 1px solid var(--line);
+            border-radius: 7px;
+            padding: 6px 10px;
+            cursor: pointer;
+            transition: all .14s ease;
+        }
+
+        button.chip:hover {
+            color: var(--text);
+            border-color: var(--line-2);
+        }
+
+        button.chip.on {
+            color: var(--bg-0);
+            background: var(--green);
+            border-color: var(--green);
+            box-shadow: 0 0 14px rgba(95, 227, 159, 0.45);
+            font-weight: 500;
+        }
+
+        button.chip.act {
+            color: var(--bg-0);
+            background: var(--cyan);
+            border-color: var(--cyan);
+            box-shadow: 0 0 14px rgba(125, 211, 252, 0.4);
+        }
+
+        .slider {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .slider input[type=range] {
+            flex: 1;
+            accent-color: var(--green);
+        }
+
+        .slider .val {
+            font-size: 11px;
+            color: var(--text);
+            min-width: 54px;
+            text-align: right;
+        }
+
+        /* ---- HUD ---- */
+        #hud {
+            position: absolute;
+            top: 18px;
+            right: 20px;
+            z-index: 6;
+            text-align: right;
+            font-size: 11px;
+            line-height: 1.7;
+            color: var(--dim);
+        }
+
+        #hud .k {
+            color: var(--faint);
+        }
+
+        #hud .v {
+            color: var(--text);
+            font-weight: 500;
+        }
+
+        #hud .fps {
+            font-family: var(--display);
+            font-size: 26px;
+            font-weight: 700;
+            color: var(--green);
+            text-shadow: 0 0 16px rgba(95, 227, 159, 0.4);
+            line-height: 1.1;
+        }
+
+        #hud .fps.warn {
+            color: var(--amber);
+            text-shadow: 0 0 16px rgba(245, 185, 66, 0.4);
+        }
+
+        #hud .gpu-line .v {
+            color: var(--cyan);
+        }
+
+        #hud .badge {
+            display: inline-block;
+            margin-top: 6px;
+            font-size: 10px;
+            letter-spacing: 0.06em;
+            color: var(--green);
+            border: 1px solid color-mix(in srgb, var(--green) 40%, transparent);
+            border-radius: 5px;
+            padding: 2px 7px;
+        }
+
+        #hint {
+            position: absolute;
+            bottom: 22px;
+            right: 20px;
+            z-index: 5;
+            font-size: 11px;
+            color: var(--faint);
+            pointer-events: none;
+        }
+
+        @media (max-width: 620px) {
+            #panel {
+                left: 12px;
+                right: 12px;
+                bottom: 12px;
+                width: auto;
+            }
+
+            #brand {
+                top: 12px;
+                left: 14px;
+            }
+
+            #hud {
+                top: 12px;
+                right: 14px;
+            }
+
+            #hint {
+                display: none;
+            }
+        }
+    </style>
+</head>
+<body>
+<div id="stage">
+    <canvas id="c2d"></canvas>
+    <canvas id="cgl"></canvas>
+    <div id="vignette"></div>
+</div>
+
+<div id="brand">
+    <h1><span class="lp">lite-particles</span> <span class="dot">·</span> playground</h1>
+    <div class="sub">zero-GC headless engine <span class="dot">·</span> <span class="ver">v1.5.0</span></div>
+</div>
+
+<div id="hud">
+    <div class="fps" id="hFps">60</div>
+    <div><span class="k">fps</span></div>
+    <div><span class="k">particles</span> <span class="v" id="hCount">0</span></div>
+    <div><span class="k">recycled/f</span> <span class="v" id="hRec">0</span></div>
+    <div class="gpu-line"><span class="k">render</span> <span class="v" id="hMode">Canvas2D</span></div>
+    <div><span class="k" id="hExtra"></span></div>
+    <div class="badge">0 B / frame</div>
+</div>
+
+<div id="hint">move / tap the stage</div>
+
+<div id="panel">
+    <div class="grp">
+        <div class="lbl">scene</div>
+        <div class="row" id="scenes"></div>
+    </div>
+    <div class="grp">
+        <div class="lbl">render path</div>
+        <div class="row">
+            <button class="chip" id="mode2d">Canvas2D</button>
+            <button class="chip" id="modeGpu">GPU · packTo</button>
+        </div>
+    </div>
+    <div class="grp">
+        <div class="lbl"><span id="capLbl">particles</span></div>
+        <div class="slider">
+            <input type="range" id="cap" min="500" max="12000" step="500" value="6000">
+            <span class="val" id="capVal">6000</span>
+        </div>
+    </div>
+    <div class="grp">
+        <div class="row">
+            <button class="chip" id="follow">follow cursor</button>
+            <button class="chip" id="replay">replay ▸ seed</button>
+            <button class="chip" id="pause">pause</button>
+        </div>
+    </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "@zakkster/lite-random":     "../node_modules/@zakkster/lite-random/Random.js",
+    "@zakkster/lite-particles":  "../Emitter.js",
+    "@zakkster/lite-signal":     "../../LiteSignal/Signal.js",
+    "@zakkster/lite-raf":        "../../LiteRaf/RAF.js",
+    "@zakkster/lite-gl":         "../../LiteGL/GL.js",
+    "@zakkster/lite-gl/backend": "../../LiteGL/GLBackend.js"
+  }
+}
+
+</script>
+
+<script type="module">
+    import {Emitter, POINT_STRIDE} from '@zakkster/lite-particles';
+
+    const TAU = Math.PI * 2;
+    const SEED = 1337;
+    const STEP = 1 / 60;                 // fixed sim step -> deterministic replay
+    const MAX_GPU = 100000;
+    const CAP_2D = 12000;
+
+    // ---- canvases ----
+    const stage = document.getElementById('stage');
+    const c2d = document.getElementById('c2d');
+    const cgl = document.getElementById('cgl');
+    const ctx = c2d.getContext('2d');
+    let W = 0, H = 0, DPR = 1;
+
+    function resize() {
+        const r = stage.getBoundingClientRect();
+        W = Math.max(1, r.width | 0);
+        H = Math.max(1, r.height | 0);
+        DPR = Math.min(window.devicePixelRatio || 1, 2);
+        c2d.width = W * DPR;
+        c2d.height = H * DPR;
+        ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+        cgl.width = W;
+        cgl.height = H;                 // GL runs at CSS px (sim space)
+        if (sink) sink.resize(W, H);
+        if (scene && scene.onResize) scene.onResize();
+    }
+
+    window.addEventListener('resize', resize);
+
+    // ---- pointer ----
+    const pointer = {x: 0, y: 0};
+
+    function setPointer(e) {
+        const r = stage.getBoundingClientRect();
+        pointer.x = e.clientX - r.left;
+        pointer.y = e.clientY - r.top;
+    }
+
+    stage.addEventListener('pointermove', setPointer);
+    stage.addEventListener('pointerdown', (e) => {
+        setPointer(e);
+        if (scene.tap) scene.tap(pointer.x, pointer.y);
+    });
+
+    // ---- helpers ----
+    const easeOutCubic = (t) => 1 - Math.pow(1 - t, 3);
+    const R = () => emitter.random.next();
+    const style255 = (c) => `rgb(${(c[0] * 255) | 0},${(c[1] * 255) | 0},${(c[2] * 255) | 0})`;
+
+    // ---- scenes ----
+    // Each scene: { palette, cap2d, opts(), physics?, death?, step(), tap?, follow, onResize? }
+    const center = {x: 0, y: 0};
+    let simTime = 0;
+
+    const SCENES = {
+        fountain: {
+            label: 'fountain',
+            palette: [[1, .86, .35], [1, .62, .18], [1, .4, .12], [1, .25, .2]],
+            cap2d: 9000, glow: true, followable: true,
+            opts: () => ({zone: {type: 'point', x: W / 2, y: H - 40}}),
+            onResize() {
+                // position is live-mutable (no setZone, no allocation); skip while following
+                if (!(follow && this.followable) && emitter.zone) { emitter.zone.x = W / 2; emitter.zone.y = H - 40; }
+            },
+            step(perStep) {
+                emitter.emitEach(perStep, (p) => {
+                    p.vx = (R() - 0.5) * 170;
+                    p.vy = -360 - R() * 240;
+                    p.gravity = 900;
+                    p.life = p.maxLife = 1.1 + R() * 0.7;
+                    p.size = 2 + R() * 3;
+                    const i = (R() * this.palette.length) | 0;
+                    const c = this.palette[i];
+                    p.r = c[0];
+                    p.g = c[1];
+                    p.b = c[2];
+                    p.userData = i;
+                });
+            },
+            rate: 950,
+        },
+
+        fireworks: {
+            label: 'fireworks',
+            palette: [[1, .85, .35], [.45, .85, 1], [1, .42, .8], [.55, 1, .62], [1, .4, .4], [.75, .6, 1]],
+            cap2d: 12000, glow: true, followable: false,
+            opts: () => ({maxCascadeDepth: 8}),
+            launch(x) {
+                const ci = (R() * this.palette.length) | 0;
+                const c = this.palette[ci];
+                emitter.emit({
+                    x, y: H - 8, vx: (R() - 0.5) * 90, vy: -(770 + R() * 190),
+                    gravity: 520, life: 0.82 + R() * 0.32, size: 3.4,
+                    r: c[0], g: c[1], b: c[2], userData: ci * 10 + 1,     // kind 1 = rocket
+                });
+            },
+            tap(x) {
+                this.launch(x);
+            },
+            death(e, p) {
+                const kind = p.userData % 10;
+                const ci = (p.userData / 10) | 0;
+                const c = this.palette[ci] || [1, 1, 1];
+                // Burst via emitEach: mutate pooled particles in place, 0 allocation -- the same
+                // discipline the engine uses, honoured here so the HUD's "0 B/frame" stays true
+                // even during an onDeath cascade. (emitEach stamps the cascade generation like
+                // emit; fireworks has no zone, so initFn owns x/y.)
+                if (kind === 1) {                                        // rocket -> radial burst
+                    const n = 46;
+                    e.emitEach(n, (np, k) => {
+                        const a = (k / n) * TAU;
+                        const spd = 95 + R() * 75;
+                        np.x = p.x; np.y = p.y;
+                        np.vx = Math.cos(a) * spd; np.vy = Math.sin(a) * spd;
+                        np.gravity = 170; np.life = np.maxLife = 0.9 + R() * 0.55; np.size = 2.4;
+                        np.r = c[0]; np.g = c[1]; np.b = c[2]; np.userData = ci * 10 + 2; // kind 2 = ember
+                    });
+                } else if (kind === 2 && p._gen < 3) {                  // ember -> sparkle
+                    e.emitEach(4, (np) => {
+                        np.x = p.x; np.y = p.y;
+                        np.vx = (R() - 0.5) * 70; np.vy = (R() - 0.5) * 70;
+                        np.gravity = 120; np.life = np.maxLife = 0.3 + R() * 0.25; np.size = 1.6;
+                        np.r = 1; np.g = 0.96; np.b = 0.8; np.userData = 3;               // kind 3 = terminal
+                    });
+                }
+            },
+            step() {
+                this._t = (this._t || 0) + STEP;
+                if (this._t >= 0.85) {
+                    this._t = 0;
+                    this.launch(60 + R() * (W - 120));
+                }
+            },
+        },
+
+        shockwave: {
+            label: 'shockwave',
+            palette: [[.6, .95, 1], [.85, .98, 1], [1, 1, 1]],
+            cap2d: 9000, glow: true, followable: false,
+            opts: () => ({zone: {type: 'ring', x: W / 2, y: H / 2, radius: 12}}),
+            onResize() {
+                if (emitter.zone) { emitter.zone.x = W / 2; emitter.zone.y = H / 2; }  // position is live-mutable
+            },
+            ring(x, y, count, base) {
+                // emitEach = 0 allocation for the whole burst. The ring zone gets sampled first
+                // (its position is discarded here -- a tap burst is centred on the pointer, so
+                // initFn overrides x/y); the ambient step() below is what actually uses the zone.
+                emitter.emitEach(count, (np, k) => {
+                    const a = (k / count) * TAU;
+                    const spd = base + R() * 120;
+                    np.x = x; np.y = y;
+                    np.vx = Math.cos(a) * spd; np.vy = Math.sin(a) * spd;
+                    np.gravity = 0; np.drag = 0.985; np.life = np.maxLife = 0.5 + R() * 0.35; np.size = 2.4;
+                    np.r = .7; np.g = .95; np.b = 1; np.userData = 0;
+                });
+            },
+            tap(x, y) {
+                this.ring(x, y, 150, 180);
+            },
+            step(perStep) {                                            // ambient ring from the zone perimeter
+                emitter.emitEach(perStep, (p) => {
+                    const a = Math.atan2(p.y - H / 2, p.x - W / 2);
+                    const spd = 60 + R() * 40;
+                    p.vx = Math.cos(a) * spd;
+                    p.vy = Math.sin(a) * spd;
+                    p.drag = 0.99;
+                    p.life = p.maxLife = 0.9 + R() * 0.5;
+                    p.size = 1.8 + R() * 1.6;
+                    const i = (R() * this.palette.length) | 0;
+                    const c = this.palette[i];
+                    p.r = c[0];
+                    p.g = c[1];
+                    p.b = c[2];
+                    p.userData = i;
+                });
+            },
+            rate: 320,
+        },
+
+        snow: {
+            label: 'snow',
+            palette: [[.92, .96, 1], [.78, .86, 1], [1, 1, 1]],
+            cap2d: 10000, glow: false, followable: false,
+            opts: () => ({
+                zone: {type: 'line', x1: 0, y1: -8, x2: W, y2: -8},
+                bounds: {x: -40, y: -40, width: W + 80, height: H + 80}
+            }),
+            physics(p) {
+                p.vx += Math.sin(simTime * 0.8 + p.y * 0.02) * 6 * STEP;
+            },
+            step(perStep) {
+                emitter.emitEach(perStep, (p) => {
+                    p.vx = (R() - 0.5) * 18;
+                    p.vy = 34 + R() * 44;
+                    p.drag = 0.995;
+                    p.life = p.maxLife = 8;
+                    p.size = 1.4 + R() * 2.4;
+                    const i = (R() * this.palette.length) | 0;
+                    const c = this.palette[i];
+                    p.r = c[0];
+                    p.g = c[1];
+                    p.b = c[2];
+                    p.userData = i;
+                });
+            },
+            onResize() {
+                // a line's endpoints are DIMENSIONS -> setZone is the sanctioned path (a raw
+                // dimension write skips validation). bounds is a plain object we own -> mutate it.
+                emitter.setZone({type: 'line', x1: 0, y1: -8, x2: W, y2: -8});
+                const b = emitter.bounds;
+                if (b) { b.x = -40; b.y = -40; b.width = W + 80; b.height = H + 80; }
+                else emitter.bounds = {x: -40, y: -40, width: W + 80, height: H + 80};
+            },
+            rate: 260,
+        },
+
+        vortex: {
+            label: 'vortex',
+            palette: [[1, .42, .8], [.72, .42, 1], [.5, .72, 1], [1, .72, .92]],
+            cap2d: 11000, glow: true, followable: true,
+            opts: () => ({}),
+            physics(p) {
+                const dx = center.x - p.x, dy = center.y - p.y;
+                const d = Math.hypot(dx, dy) + 1e-3;
+                const pull = 26, swirl = 3.4;
+                p.vx += (dx / d * pull - dy / d * swirl * (d * 0.02)) * STEP * 6;
+                p.vy += (dy / d * pull + dx / d * swirl * (d * 0.02)) * STEP * 6;
+                p.vx *= 0.985;
+                p.vy *= 0.985;
+            },
+            step(perStep) {
+                emitter.emitEach(perStep, (p) => {
+                    const a = R() * TAU, rad = 120 + R() * 90;
+                    p.x = center.x + Math.cos(a) * rad;
+                    p.y = center.y + Math.sin(a) * rad;
+                    const spd = 40 + R() * 40;
+                    p.vx = -Math.sin(a) * spd;
+                    p.vy = Math.cos(a) * spd;
+                    p.life = p.maxLife = 2 + R() * 2.2;
+                    p.size = 1.8 + R() * 2.2;
+                    const i = (R() * this.palette.length) | 0;
+                    const c = this.palette[i];
+                    p.r = c[0];
+                    p.g = c[1];
+                    p.b = c[2];
+                    p.userData = i;
+                });
+            },
+            rate: 700,
+        },
+    };
+
+    // ---- engine state ----
+    let emitter = null, scene = null, fade = null, styleCache = [];
+    let sceneName = 'fountain';
+    let mode = '2d';          // '2d' | 'gpu'
+    let follow = true;
+    let paused = false;
+    let cap = 6000;
+
+    // GPU
+    let gl = null, sink = null, packBuf = null, glReady = false;
+
+    function rebuild() {
+        if (emitter) emitter.destroy();
+        scene = SCENES[sceneName];
+        const wantCap = mode === 'gpu' ? cap : Math.min(cap, scene.cap2d);
+        const opts = scene.opts();
+        opts.maxParticles = wantCap;
+        opts.seed = SEED;
+        opts.curves = {fade: easeOutCubic};
+        emitter = new Emitter(opts);
+        fade = emitter.curve('fade');
+        emitter.onUpdate = (p, dt) => {
+            if (scene.physics) scene.physics(p, dt);
+            const nl = p.life / p.maxLife;
+            p.a = fade(nl > 0 ? (nl < 1 ? nl : 1) : 0);
+        };
+        if (scene.death) emitter.onDeath = (p) => scene.death(emitter, p);
+        styleCache = scene.palette.map(style255);
+        applyFollow();
+    }
+
+    function applyFollow() {
+        center.x = W / 2;
+        center.y = H / 2;
+        if (follow && scene.followable && emitter.zone) emitter.follow(pointer);
+        else if (emitter.zone) emitter.follow(null);
+    }
+
+    // ---- GPU wiring (lazy) ----
+    async function ensureGPU() {
+        if (glReady) return true;
+        gl = cgl.getContext('webgl2', {
+            alpha: true,
+            premultipliedAlpha: false,
+            antialias: false,
+            preserveDrawingBuffer: true
+        });
+        if (!gl) return false;
+        const {createPointSink} = await import('@zakkster/lite-gl/backend');
+        sink = createPointSink(gl, {capacity: MAX_GPU});
+        sink.resize(W, H);
+        packBuf = new Float32Array(MAX_GPU * POINT_STRIDE);
+        glReady = true;
+        return true;
+    }
+
+    // ---- render ----
+    function render2d() {
+        // translucent wipe -> motion trails
+        ctx.globalCompositeOperation = 'source-over';
+        ctx.fillStyle = 'rgba(7,9,13,0.28)';
+        ctx.fillRect(0, 0, W, H);
+        ctx.globalCompositeOperation = scene.glow ? 'lighter' : 'source-over';
+        const cache = styleCache, n = cache.length;
+        emitter.draw(ctx, (cx, p, nl) => {
+            cx.globalAlpha = p.a;
+            cx.fillStyle = cache[p.userData % n];
+            const s = p.size * (0.5 + 0.5 * nl);
+            cx.fillRect(p.x - s * 0.5, p.y - s * 0.5, s, s);
+        });
+        ctx.globalAlpha = 1;
+        ctx.globalCompositeOperation = 'source-over';
+    }
+
+    function renderGPU() {
+        gl.clearColor(0.027, 0.035, 0.05, 1);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+        gl.enable(gl.BLEND);
+        gl.blendFunc(gl.SRC_ALPHA, gl.ONE);     // additive glow
+        const nn = emitter.packTo(packBuf);
+        sink.upload(packBuf, 0, nn * POINT_STRIDE);
+        sink.draw(nn);
+    }
+
+    // ---- one fixed sim step (shared by the loop and the screenshot rig) ----
+    function simStep() {
+        simTime += STEP;
+        if (follow && scene.followable) {
+            center.x = pointer.x;
+            center.y = pointer.y;
+        }
+        // In GPU mode, scale emission with the cap so the pool actually fills toward 100k
+        // (the whole point of the packTo showcase); Canvas2D keeps the base rate.
+        const boost = mode === 'gpu' ? Math.max(4, Math.round(cap / 1400)) : 1;
+        const perStep = scene.rate ? Math.round(scene.rate * STEP * boost) : 0;
+        scene.step(perStep);
+        emitter.update(STEP);
+    }
+
+    // ---- loop (fixed timestep) ----
+    let last = performance.now(), acc = 0;
+    let frames = 0, fpsAcc = 0, fps = 60, lastHud = 0;
+
+    function frame(now) {
+        requestAnimationFrame(frame);
+        let dt = (now - last) / 1000;
+        last = now;
+        if (dt > 0.1) dt = 0.1;                  // clamp after a stall / backgrounded tab
+
+        if (!paused) {
+            acc += dt;
+            let steps = 0;
+            while (acc >= STEP && steps < 4) {
+                simStep();
+                acc -= STEP;
+                steps++;
+            }
+        }
+
+        if (mode === 'gpu' && glReady) renderGPU(); else render2d();
+
+        frames++;
+        fpsAcc += dt;
+        if (now - lastHud > 250) {
+            fps = fpsAcc > 0 ? Math.round(frames / fpsAcc) : fps;
+            frames = 0;
+            fpsAcc = 0;
+            lastHud = now;
+            updateHUD();
+        }
+    }
+
+    // ---- HUD ----
+    const hFps = document.getElementById('hFps'), hCount = document.getElementById('hCount'),
+        hRec = document.getElementById('hRec'), hMode = document.getElementById('hMode'),
+        hExtra = document.getElementById('hExtra');
+
+    function updateHUD() {
+        hFps.textContent = fps;
+        hFps.classList.toggle('warn', fps < 50);
+        hCount.textContent = emitter.activeCount.toLocaleString();
+        hRec.textContent = emitter.recycledThisFrame;
+        hMode.textContent = mode === 'gpu' ? 'GPU · lite-gl' : 'Canvas2D';
+        hExtra.textContent = mode === 'gpu'
+            ? 'packTo → 1 instanced draw'
+            : 'draw() callback';
+    }
+
+    // ---- controls ----
+    const scenesRow = document.getElementById('scenes');
+    Object.keys(SCENES).forEach((name) => {
+        const b = document.createElement('button');
+        b.className = 'chip' + (name === sceneName ? ' on' : '');
+        b.textContent = SCENES[name].label;
+        b.dataset.scene = name;
+        b.onclick = () => {
+            sceneName = name;
+            [...scenesRow.children].forEach((c) => c.classList.toggle('on', c.dataset.scene === name));
+            rebuild();
+            syncFollowBtn();
+        };
+        scenesRow.appendChild(b);
+    });
+
+    const btn2d = document.getElementById('mode2d');
+    const btnGpu = document.getElementById('modeGpu');
+    const capEl = document.getElementById('cap');
+    const capVal = document.getElementById('capVal');
+    const capLbl = document.getElementById('capLbl');
+    const followBtn = document.getElementById('follow');
+    const pauseBtn = document.getElementById('pause');
+    const replayBtn = document.getElementById('replay');
+
+    function syncModeBtns() {
+        btn2d.classList.toggle('act', mode === '2d');
+        btnGpu.classList.toggle('act', mode === 'gpu');
+    }
+
+    function syncFollowBtn() {
+        followBtn.classList.toggle('on', follow && scene.followable);
+        followBtn.style.opacity = scene.followable ? '1' : '0.4';
+    }
+
+    function setCapBounds() {
+        if (mode === 'gpu') {
+            capEl.max = MAX_GPU;
+            capEl.step = 2000;
+            capLbl.textContent = 'particles (GPU)';
+        } else {
+            capEl.max = CAP_2D;
+            capEl.step = 500;
+            capLbl.textContent = 'particles';
+        }
+        if (cap > +capEl.max) cap = +capEl.max;
+        capEl.value = cap;
+        capVal.textContent = cap.toLocaleString();
+    }
+
+    btn2d.onclick = () => {
+        if (mode === '2d') return;
+        mode = '2d';
+        c2d.style.display = 'block';
+        cgl.style.display = 'none';
+        cap = Math.min(cap, CAP_2D);
+        setCapBounds();
+        rebuild();
+        syncModeBtns();
+    };
+    btnGpu.onclick = async () => {
+        if (mode === 'gpu') return;
+        const ok = await ensureGPU();
+        if (!ok) {
+            hMode.textContent = 'WebGL2 unavailable';
+            return;
+        }
+        mode = 'gpu';
+        cgl.style.display = 'block';
+        c2d.style.display = 'none';
+        cap = MAX_GPU;
+        setCapBounds();
+        rebuild();
+        syncModeBtns();
+    };
+    capEl.oninput = () => {
+        cap = +capEl.value;
+        capVal.textContent = cap.toLocaleString();
+        rebuild();
+    };
+    followBtn.onclick = () => {
+        follow = !follow;
+        applyFollow();
+        syncFollowBtn();
+    };
+    pauseBtn.onclick = () => {
+        paused = !paused;
+        pauseBtn.classList.toggle('on', paused);
+        pauseBtn.textContent = paused ? 'resume' : 'pause';
+    };
+    replayBtn.onclick = () => {
+        // Deterministic: reset the seed + sim clock, no pointer input. Fixed-step + seeded rng
+        // -> byte-identical every press. Snap to a fixed origin so positions replay too.
+        follow = false;
+        syncFollowBtn();
+        simTime = 0;
+        acc = 0;
+        emitter.clear();
+        emitter.seed(SEED);
+        if (emitter.zone) {                     // pin the zone origin so replay is positional too
+            if (emitter.zone.type === 'point' || emitter.zone.type === 'ring') {
+                emitter.zone.x = W / 2;
+                emitter.zone.y = H / 2;
+            }
+        }
+        replayBtn.classList.add('act');
+        setTimeout(() => replayBtn.classList.remove('act'), 400);
+    };
+
+    // ---- boot ----
+    resize();
+    pointer.x = W / 2;
+    pointer.y = H / 2;
+    cap = 6000;
+    setCapBounds();
+    rebuild();
+    syncModeBtns();
+    syncFollowBtn();
+    requestAnimationFrame(frame);
+
+    // Screenshot/test rig (gated behind ?rig): pump N fixed steps + render, independent of the
+    // rAF cadence a hidden tab throttles. Never touched in normal use.
+    if (new URLSearchParams(location.search).has('rig')) {
+        window.__lp = {
+            pump(n = 120) {
+                for (let i = 0; i < n; i++) simStep();
+                if (mode === 'gpu' && glReady) renderGPU(); else render2d();
+                updateHUD();
+                return emitter.activeCount;
+            },
+            setScene(name) {
+                sceneName = name;
+                [...scenesRow.children].forEach((c) => c.classList.toggle('on', c.dataset.scene === name));
+                rebuild();
+                syncFollowBtn();
+            },
+            setFollow(v) {
+                follow = v;
+                applyFollow();
+                syncFollowBtn();
+            },
+            setPointer(x, y) {
+                pointer.x = x;
+                pointer.y = y;
+            },
+            tap(x, y) {
+                if (scene.tap) scene.tap(x, y);
+            },
+        };
+    }
+</script>
+</body>
+</html>
