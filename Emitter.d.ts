@@ -15,10 +15,23 @@ export interface Particle {
     /** Life at birth. `life / maxLife` is the normalized life passed to draw(). */
     maxLife: number;
     size: number;
+    /** Red channel, [0,1]. Default 1 (opaque white). Fed to the GPU by {@link Emitter.packTo}. */
+    r: number;
+    /** Green channel, [0,1]. Default 1. */
+    g: number;
+    /** Blue channel, [0,1]. Default 1. */
+    b: number;
+    /** Alpha channel, [0,1]. Default 1. */
+    a: number;
     /**
-     * The ONE escape hatch for custom state (colours, sprites, metadata). Any field
-     * outside this schema must live here: `emit()` throws on an unknown top-level key,
-     * and particles are sealed, so a stray property cannot be welded on elsewhere.
+     * A numeric handle (v1.5.0) — an integer id into your own registry (sprite table,
+     * ECS entity). The GPU/typed-array-friendly sibling of `data`. Default 0.
+     */
+    userData: number;
+    /**
+     * The object escape hatch for arbitrary custom state (sprites, closures, metadata).
+     * Any field outside this schema must live here (or, if numeric, on `userData`):
+     * `emit()` throws on an unknown top-level key, and particles are sealed.
      */
     data: unknown;
 }
@@ -135,6 +148,16 @@ export declare const VERSION: string;
  */
 export declare const ZONE_DRAWS: Readonly<{ point: 0; line: 1; rect: 2; ring: 2 }>;
 
+/**
+ * The GPU handoff contract (v1.5.0). {@link Emitter.packTo} writes @zakkster/lite-gl
+ * LAYOUT.POINT instances: `POINT_STRIDE` (8) floats per particle, laid out by
+ * `POINT_OFFSETS` — (x, y, size, r, g, b, a, _pad), in SCREEN PIXELS. Bump `LAYOUT_VERSION`
+ * if the packed shape ever changes.
+ */
+export declare const LAYOUT_VERSION: number;
+export declare const POINT_STRIDE: 8;
+export declare const POINT_OFFSETS: Readonly<{ x: 0; y: 1; size: 2; r: 3; g: 4; b: 5; a: 6; _pad: 7 }>;
+
 /** Validate + normalize a zone. Throws on a malformed one. Returns a fresh, mutable object. */
 export declare function normalizeZone(zone: EmissionZone | null | undefined): EmissionZone | null;
 
@@ -237,6 +260,20 @@ export declare class Emitter {
 
     /** normalizedLife is 1.0 at birth, 0.0 at death — always clamped to [0,1], never NaN. */
     draw<C>(ctx: C, renderCallback: (ctx: C, particle: Particle, normalizedLife: number) => void): void;
+
+    /**
+     * Pack the active particles into a @zakkster/lite-gl `LAYOUT.POINT` buffer and return
+     * the count. Each particle writes `POINT_STRIDE` (8) floats — (x, y, size, r, g, b, a,
+     * _pad) — read straight from its fields, zero allocation. The GPU handoff (v1.5.0): a
+     * Canvas2D system reaches 100k instances in one instanced draw. POINT is SCREEN PIXELS.
+     * `out` must hold `offset + activeCount*8` floats or a `RangeError` is thrown (and a
+     * non-`Float32Array` `out` throws a `TypeError`).
+     *
+     *     const buf = new Float32Array(emitter.pool.size * POINT_STRIDE);
+     *     const n = emitter.packTo(buf);
+     *     sink.upload(buf, 0, n * POINT_STRIDE, 0, POINT_STRIDE);
+     */
+    packTo(out: Float32Array, offset?: number): number;
 
     /** Kill all particles instantly. */
     clear(): void;

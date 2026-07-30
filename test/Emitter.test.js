@@ -1,7 +1,7 @@
 import { describe, it, beforeEach, mock } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { Emitter, normalizeZone, VERSION, ZONE_DRAWS } from '../Emitter.js';
+import { Emitter, normalizeZone, VERSION, ZONE_DRAWS, POINT_STRIDE, LAYOUT_VERSION, POINT_OFFSETS } from '../Emitter.js';
 import { Random } from '@zakkster/lite-random';
 // devDependencies (v1.4.0): the easing curves and interpolation used to build and
 // cross-check the LUTs. The runtime reads a baked table and depends on neither.
@@ -660,14 +660,17 @@ describe('lite-particles', () => {
 
         it('a recycled particle carries exactly the schema fields, no inherited key', () => {
             const e = new Emitter({ maxParticles: 2 });
-            e.emit({ x: 1, life: 1, data: { color: 'red' } });
+            e.emit({ x: 1, life: 1, r: 0.9, userData: 7, data: { color: 'red' } });
             e.clear();
             const p = e.emit({ x: 5, life: 1 });
+            // v1.5.0 added first-class colour (r,g,b,a) and the numeric userData handle.
             assert.deepEqual(
                 Object.keys(p).sort(),
-                ['data', 'drag', 'gravity', 'life', 'maxLife', 'size', 'vx', 'vy', 'x', 'y'],
+                ['a', 'b', 'data', 'drag', 'g', 'gravity', 'life', 'maxLife', 'r', 'size', 'userData', 'vx', 'vy', 'x', 'y'],
             );
-            assert.equal(p.data, null); // no ghost value from the dead particle
+            assert.equal(p.data, null);     // no ghost object from the dead particle
+            assert.equal(p.r, 1);           // colour reset to opaque white, not the dead 0.9
+            assert.equal(p.userData, 0);    // handle reset to 0, not the dead 7
         });
 
         it('particles are sealed, so a hook cannot weld a stray key on', () => {
@@ -1119,6 +1122,118 @@ describe('lite-particles', () => {
         it('throws if asked to follow with no zone to move', () => {
             const e = new Emitter({ maxParticles: 4 });
             assert.throws(() => e.follow({ x: 1, y: 1 }), TypeError);
+        });
+    });
+
+    // -- v1.5.0: first-class colour ------------------------------------------------------
+    describe('colour columns (v1.5.0)', () => {
+        it('defaults to opaque white', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            const p = e.emit({ life: 1 });
+            assert.deepEqual([p.r, p.g, p.b, p.a], [1, 1, 1, 1]);
+        });
+
+        it('emit() assigns r,g,b,a from config', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            const p = e.emit({ life: 1, r: 0.2, g: 0.4, b: 0.6, a: 0.8 });
+            assert.deepEqual([p.r, p.g, p.b, p.a], [0.2, 0.4, 0.6, 0.8]);
+        });
+
+        it('resets to opaque white on recycle (no inherited colour, LP-01)', () => {
+            const e = new Emitter({ maxParticles: 1 });
+            e.emit({ life: 1, r: 0.1, g: 0.2, b: 0.3, a: 0.4 });
+            e.clear();
+            const p = e.emit({ life: 1 });
+            assert.deepEqual([p.r, p.g, p.b, p.a], [1, 1, 1, 1]);
+        });
+
+        it('an unknown colour-ish key still throws (color is not a field)', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            assert.throws(() => e.emit({ life: 1, color: 'red' }), TypeError);
+        });
+    });
+
+    // -- v1.5.0: userData numeric handle -------------------------------------------------
+    describe('userData handle (v1.5.0)', () => {
+        it('round-trips an integer and coexists with the data object', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            const p = e.emit({ life: 1, userData: 12345, data: { sprite: 'boom' } });
+            assert.equal(p.userData, 12345);
+            assert.equal(p.data.sprite, 'boom');
+        });
+
+        it('defaults to 0 and resets on recycle', () => {
+            const e = new Emitter({ maxParticles: 1 });
+            const a = e.emit({ life: 1 });
+            assert.equal(a.userData, 0);
+            e.emit({ life: 1 }); // (a already used the only slot; emit returns null)
+            e.clear();
+            e.emit({ life: 1, userData: 99 });
+            e.clear();
+            const p = e.emit({ life: 1 });
+            assert.equal(p.userData, 0); // no ghost handle from the dead particle
+        });
+    });
+
+    // -- v1.5.0: packTo GPU handoff ------------------------------------------------------
+    describe('packTo (v1.5.0)', () => {
+        it('exports the layout contract', () => {
+            assert.equal(POINT_STRIDE, 8);
+            assert.equal(LAYOUT_VERSION, 1);
+            assert.deepEqual(POINT_OFFSETS, { x: 0, y: 1, size: 2, r: 3, g: 4, b: 5, a: 6, _pad: 7 });
+        });
+
+        it('writes (x,y,size,r,g,b,a,_pad) per particle and returns the count', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            e.emit({ x: 10, y: 20, size: 3, r: 0.5, g: 0.25, b: 0.75, a: 0.5, life: 1 });
+            e.emit({ x: 30, y: 40, size: 2, life: 1 }); // opaque white default
+            const buf = new Float32Array(4 * POINT_STRIDE);
+            const n = e.packTo(buf);
+            assert.equal(n, 2);
+            const f = Math.fround;
+            assert.deepEqual(Array.from(buf.slice(0, 8)), [f(10), f(20), f(3), f(0.5), f(0.25), f(0.75), f(0.5), 0]);
+            assert.deepEqual(Array.from(buf.slice(8, 16)), [f(30), f(40), f(2), 1, 1, 1, 1, 0]);
+        });
+
+        it('honours a float offset and leaves prior floats untouched', () => {
+            const e = new Emitter({ maxParticles: 2 });
+            e.emit({ x: 7, life: 1 });
+            const buf = new Float32Array(2 * POINT_STRIDE);
+            buf.fill(-1);
+            const n = e.packTo(buf, POINT_STRIDE);
+            assert.equal(n, 1);
+            assert.equal(buf[0], -1);                 // before the offset: untouched
+            assert.equal(buf[POINT_STRIDE], Math.fround(7)); // x of instance 0 at the offset
+        });
+
+        it('throws RangeError on a too-small buffer (fail closed)', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            e.emit({ life: 1 });
+            e.emit({ life: 1 });
+            assert.throws(() => e.packTo(new Float32Array(POINT_STRIDE)), RangeError); // room for 1, need 2
+        });
+
+        it('throws TypeError on a non-Float32Array out', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            e.emit({ life: 1 });
+            assert.throws(() => e.packTo([]), TypeError);
+            assert.throws(() => e.packTo(new Float64Array(64)), TypeError);
+        });
+
+        it('returns 0 and writes nothing when empty', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            const buf = new Float32Array(POINT_STRIDE).fill(-1);
+            assert.equal(e.packTo(buf), 0);
+            assert.equal(buf[0], -1);
+        });
+
+        it('reflects live count after expiry', () => {
+            const e = new Emitter({ maxParticles: 4 });
+            e.emit({ life: 0.5 });
+            e.emit({ life: 5 });
+            e.update(1); // first expires
+            const buf = new Float32Array(4 * POINT_STRIDE);
+            assert.equal(e.packTo(buf), 1);
         });
     });
 });

@@ -4,6 +4,67 @@ All notable changes to `@zakkster/lite-particles` are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-07-30
+
+The GPU handoff, additive and non-breaking. Particles gain first-class colour and a
+numeric handle, and `packTo()` streams them straight into a `@zakkster/lite-gl`
+`LAYOUT.POINT` buffer -- a Canvas2D particle system reaches 100k GPU instances in one
+instanced draw, with no per-particle JS call. Every existing call site keeps working.
+
+This shipped as a **minor, not the planned 2.0.0 major** -- see *A shelved rewrite* below.
+
+### Added
+
+- **First-class colour: `r`, `g`, `b`, `a` particle fields** (`[0,1]`, default opaque
+  white). Settable via `emit({ r, g, b, a })` / `emitEach`, reset to white on recycle
+  (no inherited colour, LP-01). Previously colour lived only in the untyped `data` hatch.
+- **`userData` -- a numeric particle handle** (integer id into your own sprite/entity
+  registry). The typed sibling of the `data` object, which is unchanged and still there.
+- **`packTo(out, offset = 0) -> count`.** Writes the active particles into a
+  `Float32Array` as `LAYOUT.POINT` instances -- 8 floats each, `(x, y, size, r, g, b, a,
+  _pad)`, in SCREEN PIXELS -- then hand it to a lite-gl POINT sink via
+  `sink.upload(out, 0, count * POINT_STRIDE, 0, POINT_STRIDE)`. Zero allocation, no math.
+  A too-small buffer throws `RangeError`; a non-`Float32Array` throws `TypeError`.
+- **`LAYOUT_VERSION`, `POINT_STRIDE` (8), `POINT_OFFSETS`** -- the exported, frozen packed
+  contract, the way `ZONE_DRAWS` documents the rng contract. A buffer another package
+  reads is a contract.
+- **Torture Phase H** -- `packTo` round-trips exactly (incl `_pad`), is **0 B/call at
+  100k**, guards a bad `out`, and byte-verifies against a real headless `@zakkster/lite-gl`
+  `createField({ stride: 8 })` when the sibling is present.
+
+### Changed
+
+- The particle schema grew by `r, g, b, a, userData` (5 enumerable fields). Code that
+  spreads a particle (`{...p}`) or reads `Object.keys(p)` now sees them. Nothing was
+  removed; `data` and every existing field are unchanged. This is the only observable
+  difference and is why the pinned-schema test was updated.
+
+### A shelved rewrite (why this is 1.5.0, not 2.0.0)
+
+P4 set out to replace the pooled particle **objects** with a Structure-of-Arrays column
+store and ship it as a breaking 2.0.0. Before writing it, a falsifiable perf gate and a
+fixed fail-action were authored (`decisions/0010`, `test/bench-soa.mjs`): *SoA ships as the
+default only if it does not regress `update()` at small counts and clearly wins at large
+ones.* The SoA core was built and measured against the v1.4.0 object core on an Apple M4
+Pro (node 26.3.1):
+
+```
+   N     object Mops/s   SoA Mops/s   ratio   verdict
+    100         3.771        2.279    0.604    FAIL
+    500         0.695        0.457    0.658    FAIL
+   1000         0.264        0.226    0.856    FAIL
+  10000         0.027        0.020    0.760    FAIL
+ 100000         0.003        0.002    0.755    FAIL
+```
+
+SoA regressed `update()` **25-40% at every size**, because a physics update touches most
+per-particle fields -- the access pattern that favours arrays-of-structs -- and SoA's only
+edge, streaming `packTo`, merely **ties** the object core (a hand-written AoS pack matched
+it at 100k). The number decided, not the sunk cost: SoA was **shelved** (kept as
+reproducible evidence in `test/`, never shipped) and `packTo` + colour were added to the
+object core -- the gate winner -- instead. Result: the GPU payoff, on the faster core, with
+no breaking change. See `decisions/0010` and `decisions/0011`.
+
 ## [1.4.0] - 2026-07-29
 
 Lifecycle hooks. Three features the loop was cleaned (P1) and pinned (P2) to make

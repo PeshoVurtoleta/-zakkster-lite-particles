@@ -12,6 +12,7 @@ npm install @zakkster/lite-particles
 - `Emitter` — Class
 - `normalizeZone(zone)` — Function (validate + normalize a zone; throws on a malformed one)
 - `ZONE_DRAWS` — frozen record `{ point: 0, line: 1, rect: 2, ring: 2 }`: rng draws per particle by zone type, the determinism contract
+- `LAYOUT_VERSION` (1), `POINT_STRIDE` (8), `POINT_OFFSETS` (`{ x:0, y:1, size:2, r:3, g:4, b:5, a:6, _pad:7 }`) — the packTo/lite-gl LAYOUT.POINT contract (v1.5.0)
 - `VERSION` — string
 
 ## Constructor
@@ -25,11 +26,12 @@ npm install @zakkster/lite-particles
 - `curveSegments: number` (default 256) — LUT resolution per curve
 
 ## API
-- `.emit(config): particle | null` — Spawn one particle. Config keys must be particle fields `{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }`; an UNKNOWN key THROWS a TypeError (custom colours/sprites/metadata go on `data`). `life`/`maxLife` are coupled (give either, the other mirrors it); an effective `life <= 0`, `maxLife <= 0`, or non-finite value returns null (no dead-on-arrival particle). Returns null if the pool is full.
+- `.emit(config): particle | null` — Spawn one particle. Config keys must be particle fields `{ x, y, vx, vy, gravity, drag, life, maxLife, size, r, g, b, a, userData, data }`; an UNKNOWN key THROWS a TypeError (arbitrary custom state goes on `data`, or a numeric id on `userData`). `life`/`maxLife` are coupled (give either, the other mirrors it); an effective `life <= 0`, `maxLife <= 0`, or non-finite value returns null (no dead-on-arrival particle). Returns null if the pool is full.
 - `.emitEach(count, initFn)` — Spawn multiple, allocation-free. `initFn(particle, index)` writes fields onto the particle directly (no config object). Capacity is checked before initFn, so a full pool burns no rng draw. RAW path: writes a sealed particle (a stray key throws) and the caller owns the lifecycle (set life > 0); it does not validate like emit. Returns how many spawned.
 - `.emitBurst(count, configFn)` — DEPRECATED since v1.2.0 (removed in v2.0.0); use `.emitEach`. `configFn(index)` returns a config object per particle (one allocation each).
 - `.update(dt)` — Core physics tick. **dt must be in SECONDS** (divide rAF ms by 1000). Applies gravity, drag, velocity, bounds culling, then calls onUpdate hook.
-- `.draw(ctx, renderCallback)` — Iterate alive particles for rendering. `renderCallback(ctx, particle, normalizedLife)` where normalizedLife is 1.0 at birth → 0.0 at death, ALWAYS clamped to [0,1] and never NaN (even if a hook wrote a bad life/maxLife).
+- `.draw(ctx, renderCallback)` — Iterate alive particles for rendering (Canvas2D). `renderCallback(ctx, particle, normalizedLife)` where normalizedLife is 1.0 at birth → 0.0 at death, ALWAYS clamped to [0,1] and never NaN (even if a hook wrote a bad life/maxLife).
+- `.packTo(out, offset=0): count` — GPU handoff (v1.5.0). Pack active particles into a Float32Array as lite-gl LAYOUT.POINT instances: 8 floats each `(x, y, size, r, g, b, a, _pad)`, SCREEN PIXELS. Zero allocation, no math (a plain copy). Returns the count written. `out` must hold `offset + activeCount*8` floats or RangeError; a non-Float32Array `out` throws TypeError. Feed to a POINT sink: `sink.upload(out, 0, count*POINT_STRIDE, 0, POINT_STRIDE)`.
 - `.follow(target | null)` — Track a moving target WORLD-SPACE (v1.4.0): each update() moves the ZONE ORIGIN to `target.x`/`target.y` (two reads, O(1)); already-emitted particles stay where they were born. `null` stops. Throws if no zone is set. A null/non-finite target is a per-frame no-op (no NaN written).
 - `.curve(name)` — The baked sampler for a configured curve: `emitter.curve('size')(normalizedLife)` returns the eased value with no easing math on the hot path. Hoist it out of your render loop (stable closure). Throws on an unknown name.
 - `.curveTable(name)` — The raw Float32Array LUT behind a curve, for a bare index. Throws on an unknown name.
@@ -38,7 +40,10 @@ npm install @zakkster/lite-particles
 - `.destroy()` — Destroy pool. Idempotent. Does NOT fire onDeath.
 
 ## Particle Properties
-`{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }`
+`{ x, y, vx, vy, gravity, drag, life, maxLife, size, r, g, b, a, userData, data }`
+- `r, g, b, a` — colour in [0,1] (v1.5.0), default 1 (opaque white), reset to white on recycle; streamed to the GPU by packTo
+- `userData` — numeric handle (v1.5.0), default 0; an integer id into your own registry (typed sibling of `data`)
+- `data` — object escape hatch for arbitrary custom state (unchanged)
 
 ## Physics Pipeline (per frame)
 1. `life -= dt`
@@ -207,3 +212,32 @@ target.x/target.y (two reads, O(1), never per-particle), leaving already-emitted
 were born (a comet trail). Point/ring/rect move the origin; a line zone translates by delta.
 follow(null) stops. Following with no zone throws. A null/non-finite target is a per-frame no-op that
 writes no NaN (fail closed). update() under an active follow is 0 B/call.
+
+## v1.5.0 — GPU handoff (packTo + colour), additive/non-breaking
+
+### First-class colour + userData
+Particles gained `r, g, b, a` ([0,1], default opaque white, reset on recycle) and a numeric `userData`
+handle (an integer id into your own registry). Both are settable via emit()/emitEach and validated by
+the sealed schema. The `data` object escape hatch is unchanged and still present. Colour previously
+lived only in `data`; it is now first-class so packTo can stream it to the GPU.
+
+### packTo — one method to the GPU
+`emitter.packTo(out, offset=0)` writes the active particles into a Float32Array as @zakkster/lite-gl
+LAYOUT.POINT instances (8 floats: x, y, size, r, g, b, a, _pad; SCREEN PIXELS) and returns the count.
+Zero allocation, no math. Hand it to a POINT sink:
+  const buf = new Float32Array(emitter.pool.size * POINT_STRIDE);   // once
+  const n = emitter.packTo(buf);
+  sink.upload(buf, 0, n * POINT_STRIDE, 0, POINT_STRIDE);           // per frame
+A Canvas2D particle system reaches 100k GPU instances in one instanced draw, no per-particle JS call.
+LAYOUT_VERSION/POINT_STRIDE/POINT_OFFSETS export the contract. Too-small out -> RangeError; non-
+Float32Array out -> TypeError. Torture Phase H proves the round-trip (incl _pad), 0 B/call at 100k,
+and byte-parity against a real headless lite-gl createField({ stride: 8 }).
+
+### Why the object core, not Structure-of-Arrays
+P4 prototyped an SoA column store to feed the GPU, behind a falsifiable perf gate written FIRST
+(decisions/0010, test/bench-soa.mjs). It regressed update() 25-40% at EVERY particle count, because a
+physics update touches most per-particle fields — the access pattern that favours arrays-of-structs —
+while its only edge, streaming packTo, merely tied the object core. The number decided: SoA was
+shelved (kept as reproducible evidence in test/, never shipped) and packTo was added to the object
+core instead. The GPU payoff, on the faster core, with no breaking change. See decisions/0010-0011.
+This is why v1.5.0 is a minor, not the originally-planned 2.0.0.

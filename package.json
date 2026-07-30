@@ -1,6 +1,6 @@
 {
   "name": "@zakkster/lite-particles",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "A headless particle engine with GC-free physics, lifecycle management, bounds culling, declarative emission zones, and seeded deterministic replay.",
   "type": "module",
   "main": "./Emitter.js",

@@ -9,19 +9,6 @@
  * IMPORTANT: dt is in SECONDS (not milliseconds).
  * If using requestAnimationFrame, divide by 1000: emitter.update(dt / 1000)
  *
- * v1.5.0 — GPU handoff (additive, non-breaking). The particle schema gains first-class
- *          r,g,b,a colour fields ([0,1], default opaque white) and a numeric `userData`
- *          handle (an integer id into your own registry — the GPU/ECS-friendly sibling of
- *          the object `data` escape hatch, which is unchanged). `packTo(out, offset)` writes
- *          the active particles straight into a @zakkster/lite-gl LAYOUT.POINT buffer
- *          (x, y, size, r, g, b, a, _pad) — zero allocation — so a Canvas2D system reaches
- *          the GPU (100k instances in one draw) with one method. LAYOUT_VERSION / POINT_STRIDE
- *          / POINT_OFFSETS export the packed contract. NOTE: a Structure-of-Arrays core was
- *          built and measured against this object core (test/bench-soa.mjs, decisions/0010);
- *          it REGRESSED update() 25-40% at every size because a physics update touches most
- *          per-particle fields (the AoS-favourable pattern) and SoA's only edge (streaming
- *          packTo) merely ties the object core — so SoA was SHELVED and packTo added here
- *          instead. The number decided, not the sunk cost. See decisions/0010-0011.
  * v1.4.0 — lifecycle hooks: onDeath(p) sub-emitter fires on life-expiry (a dying spark
  *          can spawn embers), bounded by a per-particle generation cap that THROWS past
  *          maxCascadeDepth; `curves` bakes easing functions into Float32Array LUTs read
@@ -52,33 +39,20 @@
 import { Random } from '@zakkster/lite-random';
 
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = '1.5.0';
+export const VERSION = '1.4.0';
 
 const TAU = Math.PI * 2;
 
 /**
  * The particle schema — the only fields emit() will copy from a config object.
- * A key outside this set is rejected (see emit()): arbitrary custom state belongs on the
- * `data` object escape hatch (or the numeric `userData` handle), never welded onto the
- * pooled particle, where reset() would miss it and a recycled particle would inherit a dead
- * one's state (LP-01). r,g,b,a are [0,1] colour (v1.5.0), fed to the GPU by packTo().
+ * A key outside this set is rejected (see emit()): custom colours / sprites /
+ * metadata belong on `data`, never welded onto the pooled particle, where reset()
+ * would miss them and a recycled particle would inherit a dead one's state (LP-01).
  */
 const SCHEMA_KEYS = new Set([
-    'x', 'y', 'vx', 'vy', 'gravity', 'drag', 'life', 'maxLife', 'size',
-    'r', 'g', 'b', 'a', 'userData', 'data',
+    'x', 'y', 'vx', 'vy', 'gravity', 'drag', 'life', 'maxLife', 'size', 'data',
 ]);
-const SCHEMA_FIELDS = '{ x, y, vx, vy, gravity, drag, life, maxLife, size, r, g, b, a, userData, data }';
-
-/**
- * The GPU handoff contract (v1.5.0). packTo() writes @zakkster/lite-gl LAYOUT.POINT
- * instances: 8 floats per particle, (x, y, size, r, g, b, a, _pad). SCREEN PIXELS — do any
- * world->screen projection before packing, as lite-gl's `project` expects. A buffer another
- * package reads is a contract, so the stride, the field offsets, and a version are exported
- * and frozen (bump LAYOUT_VERSION if the packed shape ever changes).
- */
-export const LAYOUT_VERSION = 1;
-export const POINT_STRIDE = 8;
-export const POINT_OFFSETS = Object.freeze({ x: 0, y: 1, size: 2, r: 3, g: 4, b: 5, a: 6, _pad: 7 });
+const SCHEMA_FIELDS = '{ x, y, vx, vy, gravity, drag, life, maxLife, size, data }';
 
 /**
  * Inline dense free-list — the O(1) pool that lite-object-pool used to provide,
@@ -300,11 +274,7 @@ export class Emitter {
                     vx: 0, vy: 0,
                     gravity: 0, drag: 1,
                     life: 0, maxLife: 1,
-                    size: 1,
-                    r: 1, g: 1, b: 1, a: 1, // [0,1] colour (v1.5.0); default opaque white so a
-                    //                          colourless particle is visible and packTo-ready
-                    userData: 0,            // numeric handle into your own registry (v1.5.0)
-                    data: null,             // arbitrary object escape hatch (sprites/metadata)
+                    size: 1, data: null, // attach custom colors/sprites/metadata HERE
                 };
                 // `_gen` is the onDeath cascade generation (private, v1.4.0). NON-ENUMERABLE
                 // on purpose: it must not appear in Object.keys(p) / {...p}, so the public
@@ -321,9 +291,6 @@ export class Emitter {
                 p.life = 0;
                 p.maxLife = 1;
                 p.size = 1;
-                p.r = p.g = p.b = p.a = 1; // reset colour to opaque white — a recycled particle
-                //                            must not inherit a dead one's colour (LP-01)
-                p.userData = 0;
                 p.data = null;
                 p._gen = 0;
             },
@@ -786,14 +753,12 @@ export class Emitter {
     }
 
     /**
-     * Iterate active particles for rendering (the Canvas2D path). For the GPU, skip the
-     * per-particle callback and use {@link Emitter#packTo} instead.
+     * Iterate active particles for rendering.
      * @param {CanvasRenderingContext2D} ctx
      * @param {Function} renderCallback - (ctx, particle, normalizedLife)
-     *   normalizedLife is 1.0 at birth, 0.0 at death — perfect for easing. The particle
-     *   carries r,g,b,a in [0,1] (v1.5.0) alongside x/y/size. To ease normalizedLife without
-     *   Math on the hot path, configure `curves` and hoist a sampler out of your loop:
-     *   `const fade = emitter.curve('alpha')` then `ctx.globalAlpha = fade(t)`.
+     *   normalizedLife is 1.0 at birth, 0.0 at death — perfect for easing. To ease it
+     *   without Math on the hot path, configure `curves` and hoist a sampler out of your
+     *   loop: `const fade = emitter.curve('alpha')` then `ctx.globalAlpha = fade(t)`.
      */
     draw(ctx, renderCallback) {
         if (this._destroyed) return;
@@ -813,57 +778,6 @@ export class Emitter {
             const normalizedLife = (p.maxLife > 0 && t > 0) ? (t < 1 ? t : 1) : 0;
             renderCallback(ctx, p, normalizedLife);
         }
-    }
-
-    /**
-     * Pack the active particles into a @zakkster/lite-gl LAYOUT.POINT buffer and return the
-     * count. Each particle writes 8 floats — (x, y, size, r, g, b, a, _pad) — read straight
-     * from its fields: zero allocation. Hand the result to a POINT sink:
-     *
-     *     const buf = new Float32Array(emitter.pool.size * POINT_STRIDE);   // once
-     *     const n = emitter.packTo(buf);
-     *     sink.upload(buf, 0, n * POINT_STRIDE, 0, POINT_STRIDE);           // per frame
-     *
-     * This is the GPU handoff (v1.5.0): a Canvas2D particle system becomes a 100k-instance
-     * GPU one in a single instanced draw, no per-particle JS call. POINT is SCREEN PIXELS —
-     * project world->screen before packing if your particles hold world coordinates. `out`
-     * must be a Float32Array large enough for `offset + activeCount*8` floats, else a
-     * RangeError (fail closed).
-     *
-     * @param {Float32Array} out        Destination POINT buffer
-     * @param {number}       [offset=0] Float offset to start writing at
-     * @returns {number} particles written (= activeCount)
-     */
-    packTo(out, offset = 0) {
-        if (this._destroyed) return 0;
-        if (!(out instanceof Float32Array)) {
-            throw new TypeError('lite-particles: packTo(out) needs a Float32Array LAYOUT.POINT buffer');
-        }
-        const pool = this.pool;
-        const slots = pool.slots;
-        const active = pool.active;
-        const end = offset + active * POINT_STRIDE;
-        if (!(offset >= 0) || end > out.length) {
-            throw new RangeError(
-                `lite-particles: packTo out too small -- need ${end} floats from offset ${offset}, ` +
-                `have ${out.length} (${active} particles x ${POINT_STRIDE})`,
-            );
-        }
-
-        let o = offset;
-        for (let i = 0; i < active; i++) {
-            const p = slots[i];
-            out[o] = p.x;
-            out[o + 1] = p.y;
-            out[o + 2] = p.size;
-            out[o + 3] = p.r;
-            out[o + 4] = p.g;
-            out[o + 5] = p.b;
-            out[o + 6] = p.a;
-            out[o + 7] = 0; // _pad
-            o += POINT_STRIDE;
-        }
-        return active;
     }
 
     /**

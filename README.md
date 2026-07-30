@@ -122,7 +122,8 @@ function frame(now) {
 | `.emitEach(count, initFn)` | Spawn many, **allocation-free**. `initFn(particle, index)` writes fields onto the particle directly. Capacity is checked before `initFn`, so a full pool burns no rng draw. Raw path: writes a sealed particle (stray key throws) and you own the lifecycle. Stops at pool limit. **Returns how many actually spawned.** |
 | `.emitBurst(count, configFn)` | **Deprecated (v1.2.0, removed in v2.0.0)** — use `.emitEach`. `configFn(index)` returns a config object per particle (one allocation each). Stops at pool limit. **Returns how many actually spawned.** |
 | `.update(dt)` | Physics tick. **dt in seconds.** Phase order (pinned): follow → decrement life → early death (+ `onDeath`) → integrate → bounds cull → `onUpdate` hook. |
-| `.draw(ctx, callback)` | Iterate for rendering. Callback: `(ctx, particle, normalizedLife)`, where `normalizedLife` is always in **`[0,1]`** (clamped, never NaN). |
+| `.draw(ctx, callback)` | Iterate for rendering (Canvas2D). Callback: `(ctx, particle, normalizedLife)`, where `normalizedLife` is always in **`[0,1]`** (clamped, never NaN). |
+| `.packTo(out, offset?)` | **GPU handoff (v1.5.0).** Pack active particles into a `Float32Array` as lite-gl `LAYOUT.POINT` instances — `(x, y, size, r, g, b, a, _pad)`, 8 floats each, screen pixels. Zero alloc. Returns the count. A too-small `out` throws `RangeError`; a non-`Float32Array` throws `TypeError`. See [GPU Handoff](#gpu-handoff-v150). |
 | `.follow(target)` | Track a moving target **world-space** (v1.4.0): each `update()` moves the zone origin to `target.x`/`target.y`. `null` stops. Throws if no zone is set. |
 | `.curve(name)` | The baked sampler for a configured curve (v1.4.0): `curve('size')(t)` returns the eased value with no easing math on the hot path. Hoist it out of your loop. |
 | `.curveTable(name)` | The raw `Float32Array` LUT behind a curve (v1.4.0), for a bare index. |
@@ -145,7 +146,9 @@ function frame(now) {
 | `life` | `0` | Remaining life in seconds. **`emit()` requires `life > 0`** — a missing or non-positive life returns `null` rather than a dead-on-arrival particle. |
 | `maxLife` | `1` | Life at birth. Defaults to `life` when only `life` is given, so `normalizedLife` starts at exactly 1.0. |
 | `size` | `1` | For use in your render callback |
-| `data` | `null` | **The one place for custom state** — colors, sprites, metadata. `emit()` throws on any other top-level key, and particles are sealed, so this is where it goes. |
+| `r`, `g`, `b`, `a` | `1` | **Colour in `[0,1]`** (v1.5.0), default opaque white. First-class fields so `packTo` can stream them to the GPU. Reset to white on recycle. |
+| `userData` | `0` | **A numeric handle** (v1.5.0) — an integer id into your own sprite/entity registry. The typed sibling of `data`. |
+| `data` | `null` | **The object escape hatch** for arbitrary custom state — sprites, closures, metadata. `emit()` throws on any other top-level key, and particles are sealed, so this (or `userData`, if numeric) is where it goes. |
 
 ## Emission Zones (v1.1.0)
 
@@ -305,6 +308,40 @@ function frame(dt) {
 ```
 
 `follow(null)` stops. It costs two property reads per frame, never per-particle. A `null` or non-finite target is a per-frame no-op (the zone holds its last position — no `NaN`).
+
+---
+
+## GPU Handoff (v1.5.0)
+
+`draw()` is the Canvas2D path — one JS callback per particle, which tops out in the tens of thousands. For hundreds of thousands, skip the per-particle call entirely: `packTo()` streams the particles into a [`@zakkster/lite-gl`](https://www.npmjs.com/package/@zakkster/lite-gl) `LAYOUT.POINT` buffer, and the GPU draws them all in one instanced call.
+
+Particles carry first-class **`r, g, b, a`** colour (`[0,1]`, default opaque white) so the packed instance is complete:
+
+```js
+import { Emitter, POINT_STRIDE } from '@zakkster/lite-particles';
+import { createPointSink } from '@zakkster/lite-gl/backend';
+
+const emitter = new Emitter({ maxParticles: 100_000 });
+const sink = createPointSink(gl, { capacity: 100_000 });
+const buf = new Float32Array(emitter.pool.size * POINT_STRIDE); // allocate ONCE
+
+emitter.emitEach(100_000, (p) => {
+  p.life = 2; p.maxLife = 2;
+  p.vx = rand(-50, 50); p.vy = rand(-50, 50);
+  p.r = 1; p.g = 0.6; p.b = 0.1; p.a = 1;   // warm spark
+});
+
+function frame(dt) {
+  emitter.update(dt);
+  const n = emitter.packTo(buf);            // 0 alloc, no math — just a copy
+  sink.upload(buf, 0, n * POINT_STRIDE, 0, POINT_STRIDE);
+  sink.draw(n);                             // one instanced draw for all n
+}
+```
+
+Each packed instance is 8 floats: `(x, y, size, r, g, b, a, _pad)` — the exported `POINT_STRIDE` / `POINT_OFFSETS` / `LAYOUT_VERSION` document the contract. `LAYOUT.POINT` is **screen pixels**, so project world→screen before packing if your particles hold world coordinates. `packTo` allocates nothing and reflects the live count; a too-small `out` throws `RangeError` (fail closed).
+
+> **Note — why the object core, not SoA?** P4 prototyped a Structure-of-Arrays column store to feed the GPU. Measured against the object core it **regressed `update()` 25–40%** at every size (a physics update touches most per-particle fields — the pattern that favours arrays-of-structs), while its one edge, `packTo`, merely tied. So the column store was shelved and `packTo` was added here instead — the GPU payoff on the faster core, with no breaking change. The evidence lives in `test/bench-soa.mjs`; the reasoning in `decisions/0010`–`0011`.
 
 ---
 
