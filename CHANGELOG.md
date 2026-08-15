@@ -4,6 +4,32 @@ All notable changes to `@zakkster/lite-particles` are documented here. The
 format follows [Keep a Changelog](https://keepachangelog.com/); this project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.1] - 2026-08-15
+
+Docs only. No behaviour change, no API change, no dependency change.
+
+### Added
+
+- `llms.txt` gains a "Positioning vs @zakkster/lite-soa-particle-engine" section.
+  The two packages are siblings, not layers: this one is the ergonomic object
+  core (pooled particles, zones, curves, onDeath cascades, seeded determinism,
+  GPU handoff via `packTo`) for a few hundred to a few thousand particles;
+  `@zakkster/lite-soa-particle-engine` is the throughput core (no per-particle
+  object; the caller writes the physics loop over raw TypedArray lanes) for
+  10K-100K particles. Neither consumes the other.
+
+  This is the reciprocal half of a decision recorded in the sibling package as
+  `decisions/0001-positioning.md`, and it is the conclusion this package's own
+  `decisions/0010-soa-perf-gate.md` already reached from the other direction:
+  the SoA column prototype regressed `update()` at every particle count
+  (ratios 0.604 / 0.658 / 0.856 / 0.760 / 0.755 at N = 100 / 500 / 1000 /
+  10000 / 100000), which is why the object core stayed the default here. The
+  measured evidence is that the two cores want different data layouts, so they
+  ship as two packages rather than one consuming the other.
+
+  Both packages target lite-gl's `LAYOUT.POINT` output contract: this one feeds
+  it today via `packTo`; the sibling adopts it in a later session.
+
 ## [1.5.0] - 2026-07-30
 
 The GPU handoff, additive and non-breaking. Particles gain first-class colour and a

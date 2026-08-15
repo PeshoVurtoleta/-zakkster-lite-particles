@@ -71,6 +71,16 @@ emitter.draw(ctx, (ctx, p, t) => {
 - User needs custom per-particle physics hooks
 - User wants to separate physics from rendering
 
+## Positioning vs @zakkster/lite-soa-particle-engine (v1.5.1)
+When to reach for the sibling: @zakkster/lite-particles is the ergonomic object
+core (pooled particles, zones, curves, onDeath cascades, seeded determinism, GPU
+handoff via packTo) for a few hundred to a few thousand particles;
+@zakkster/lite-soa-particle-engine is the throughput core (no per-particle object,
+the caller writes the physics loop over raw TypedArray lanes) for 10K-100K
+particles -- neither consumes the other. lite-particles feeds
+lite-gl's LAYOUT.POINT contract today via packTo; lite-soa-particle-engine
+adopts the same output contract in S6.
+
 ## Part of the @zakkster ecosystem
 
 ## v1.1.0 — emission zones, determinism, observability

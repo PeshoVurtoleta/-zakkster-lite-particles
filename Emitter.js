@@ -52,7 +52,7 @@
 import { Random } from '@zakkster/lite-random';
 
 /** Package version. Kept in three-place sync with package.json and CHANGELOG.md. */
-export const VERSION = '1.5.0';
+export const VERSION = '1.5.1';
 
 const TAU = Math.PI * 2;
 
